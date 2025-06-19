@@ -126,7 +126,8 @@ svc_vc_create(int fd, u_int sendsize, u_int recvsize)
 	socklen_t slen;
 
 	if (!__rpc_fd2sockinfo(fd, &si))
-		return NULL;
+		warnx("svc_vc_create: __rpc_fd2sockinfo failed");
+		goto cleanup_svc_vc_create;
 
 	r = mem_alloc(sizeof(*r));
 	if (r == NULL) {
