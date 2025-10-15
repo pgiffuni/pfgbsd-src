@@ -605,9 +605,11 @@ rpc_broadcast_exp(rpcprog_t prog, rpcvers_t vers, rpcproc_t proc,
 #endif
 						np = uaddr2taddr(
 						    fdlist[i].nconf, uaddrp);
-						done = (*eachresult)(resultsp,
-						    np, fdlist[i].nconf);
-						free(np);
+						if (np != NULL) {
+							done = (*eachresult)(resultsp,
+							    np, fdlist[i].nconf);
+							free(np);
+						}
 #ifdef PORTMAP
 					}
 #endif				/* PORTMAP */
