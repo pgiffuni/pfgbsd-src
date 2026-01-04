@@ -34,7 +34,8 @@
  * Inspired by the Linux applesmc driver.
  */
 
-#include <sys/cdefs.h>
+#include "opt_asmc.h"
+
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/conf.h>
@@ -84,7 +85,7 @@ static void 	asmc_sms_calibrate(device_t dev);
 static int 	asmc_sms_intrfast(void *arg);
 static void 	asmc_sms_printintr(device_t dev, uint8_t);
 static void 	asmc_sms_task(void *arg, int pending);
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 void		asmc_dumpall(device_t);
 static int	asmc_key_dump(device_t, int);
 #endif
@@ -505,7 +506,7 @@ static driver_t	asmc_driver = {
  */
 #define	_COMPONENT	ACPI_OEM
 ACPI_MODULE_NAME("ASMC")
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 #define ASMC_DPRINTF(str)	device_printf(dev, str)
 #else
 #define ASMC_DPRINTF(str)
@@ -818,7 +819,7 @@ asmc_resume(device_t dev)
     return (0);
 }
 
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 void asmc_dumpall(device_t dev)
 {
 	struct asmc_softc *sc = device_get_softc(dev);
@@ -929,7 +930,7 @@ nosms:
 		sc->sc_nkeys = 0;
 	}
 
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 	asmc_dumpall(dev);
 #endif
 
@@ -964,19 +965,19 @@ asmc_wait_ack(device_t dev, uint8_t val, int amount)
 static int
 asmc_wait(device_t dev, uint8_t val)
 {
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 	struct asmc_softc *sc;
 #endif
 
 	if (asmc_wait_ack(dev, val, 1000) == 0)
 		return (0);
 
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 	sc = device_get_softc(dev);
 #endif
 	val = val & ASMC_STATUS_MASK;
 
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 	device_printf(dev, "%s failed: 0x%x, 0x%x\n", __func__, val,
 	    ASMC_CMDPORT_READ(sc));
 #endif
@@ -999,7 +1000,7 @@ asmc_command(device_t dev, uint8_t command) {
 		}
 	}
 
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 	device_printf(dev, "%s failed: 0x%x, 0x%x\n", __func__, command,
 	    ASMC_CMDPORT_READ(sc));
 #endif
@@ -1045,7 +1046,7 @@ out:
 	return (error);
 }
 
-#ifdef DEBUG
+#ifdef ASMC_DEBUG
 static int
 asmc_key_dump(device_t dev, int number)
 {
