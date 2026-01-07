@@ -470,7 +470,6 @@ acpi_attach(device_t dev)
     ACPI_STATUS		status;
     int			error, state;
     UINT32		flags;
-    UINT8		TypeA, TypeB;
     char		*env;
 
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
@@ -656,11 +655,12 @@ acpi_attach(device_t dev)
 
     /* Probe all supported sleep states. */
     acpi_sleep_states[ACPI_STATE_S0] = TRUE;
-    for (state = ACPI_STATE_S1; state < ACPI_S_STATE_COUNT; state++)
-	if (ACPI_SUCCESS(AcpiEvaluateObject(ACPI_ROOT_OBJECT,
-	    __DECONST(char *, AcpiGbl_SleepStateNames[state]), NULL, NULL)) &&
-	    ACPI_SUCCESS(AcpiGetSleepTypeData(state, &TypeA, &TypeB)))
+    for (state = ACPI_STATE_S1; state <= ACPI_STATE_S5; state++) {
+	UINT8 TypeA, TypeB;
+
+	if (ACPI_SUCCESS(AcpiGetSleepTypeData(state, &TypeA, &TypeB)))
 	    acpi_sleep_states[state] = TRUE;
+    }
 
     /*
      * Dispatch the default sleep state to devices.  The lid switch is set
