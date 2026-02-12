@@ -10,6 +10,13 @@ newline.  Entries should be separated by a newline.
 
 Changes to this file should not be MFCed.
 
+0c370a416b68:
+        Update smartpqi(4) to vendor version 14.4690.0.2008 - 15.2.0.2008
+        for the SmartArray storage controllers.  This adds support for new 
+        controllers, adds code that utilizes the new BIG_IOCTL_Command_struct
+        and allows the I/O buffer size for a single passthrough ioctl to be
+        stored as a 32 bit integer instead of the original 16 bit integer.
+
 256d05617c71:
         The smartpqi(4) driver was updated to vendor version 4660.0.2002
         for the SmartArry storage controllers.
