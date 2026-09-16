@@ -828,6 +828,31 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
 		error = bwrite(bp);
+		if (error) {
+			/*
+			 * bwrite() failed: the buffer was released by
+			 * bwrite() internally, but it remains dirty in
+			 * the buffer cache.  The in-memory extent-tree
+			 * data (copied via ext4_ext_fill_path_buf above)
+			 * is now stale — it may reference physical blocks
+			 * that the caller (rollback path) will free.
+			 *
+			 * Re-acquire the buffer and discard the dirty data
+			 * so that a subsequent read re-fetches the on-disk
+			 * copy instead of observing the modified in-memory
+			 * extent tree.  If the buffer has been evicted in
+			 * the interim, getblk returns a fresh buffer and
+			 * the stale one is simply not found — acceptable
+			 * on this error-recovery path.
+			 */
+			bp = getblk(ip->i_devvp, fsbtodb(fs, blk),
+			    fs->e2fs_bsize, 0, 0, 0);
+			if (bp) {
+				bundirty(bp);
+				brelse(bp);
+			}
+			return (error);
+		}
 	} else {
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
 		error = ext2_update(ip->i_vnode, 1);
@@ -995,14 +1020,18 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 	}
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
-	bwrite(bp);
+	error = bwrite(bp);
 	bp = NULL;
+	if (error)
+		goto cleanup;
 
 	/* Fix old leaf. */
 	if (m) {
 		path[depth].ep_header->eh_ecount =
 		    htole16(le16toh(path[depth].ep_header->eh_ecount) - m);
-		ext4_ext_dirty(ip, path + depth);
+		error = ext4_ext_dirty(ip, path + depth);
+		if (error)
+			goto cleanup;
 	}
 
 	/* Create intermediate indexes. */
@@ -1042,14 +1071,18 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 		}
 
 		ext2_extent_blk_csum_set(ip, bp->b_data);
-		bwrite(bp);
+		error = bwrite(bp);
 		bp = NULL;
+		if (error)
+			goto cleanup;
 
 		/* Fix old index. */
 		if (m) {
 			path[i].ep_header->eh_ecount =
 			    htole16(le16toh(path[i].ep_header->eh_ecount) - m);
-			ext4_ext_dirty(ip, path + i);
+			error = ext4_ext_dirty(ip, path + i);
+			if (error)
+				goto cleanup;
 		}
 
 		i--;
@@ -1062,10 +1095,15 @@ cleanup:
 		brelse(bp);
 
 	if (error) {
+		/*
+		 * Roll back each metadata allocation that succeeded.
+		 * Each block was committed by ext4_ext_alloc_meta()
+		 * (i_blocks incremented), so use scalar rollback.
+		 */
 		for (i = 0; i < depth; i++) {
 			if (!ablks[i])
 				continue;
-			ext4_ext_blkfree(ip, ablks[i], 1, 0);
+			ext2_rollback_unpublished(ip, ablks[i], 1);
 		}
 	}
 
@@ -1094,7 +1132,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 
 	bp = getblk(ip->i_devvp, fsbtodb(fs, newblk), fs->e2fs_bsize, 0, 0, 0);
 	if (!bp) {
-		ext4_ext_blkfree(ip, newblk, 1, 0);
+		ext2_rollback_unpublished(ip, newblk, 1);
 		return (EIO);
 	}
 
@@ -1113,7 +1151,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 	ext2_extent_blk_csum_set(ip, bp->b_data);
 	error = bwrite(bp);
 	if (error) {
-		ext4_ext_blkfree(ip, newblk, 1, 0);
+		ext2_rollback_unpublished(ip, newblk, 1);
 		goto out;
 	}
 
@@ -1128,7 +1166,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 
 	neh = ext4_ext_inode_header(ip);
 	neh->eh_depth = htole16(path->ep_depth + 1);
-	ext4_ext_dirty(ip, curpath);
+	error = ext4_ext_dirty(ip, curpath);
 out:
 	brelse(bp);
 
@@ -1195,7 +1233,7 @@ ext4_ext_correct_indexes(struct inode *ip, struct ext4_extent_path *path)
 	struct ext4_extent_header *eh;
 	struct ext4_extent *ex;
 	int32_t border;
-	int depth, k;
+	int depth, k, error;
 
 	depth = ext4_ext_inode_depth(ip);
 	eh = path[depth].ep_header;
@@ -1214,22 +1252,40 @@ ext4_ext_correct_indexes(struct inode *ip, struct ext4_extent_path *path)
 	k = depth - 1;
 	border = le32toh(path[depth].ep_ext->e_blk);
 	path[k].ep_index->ei_blk = htole32(border);
-	ext4_ext_dirty(ip, path + k);
+	error = ext4_ext_dirty(ip, path + k);
+	if (error)
+		return (error);
 	while (k--) {
 		/* Change all left-side indexes. */
 		if (path[k+1].ep_index != EXT_FIRST_INDEX(path[k+1].ep_header))
 			break;
 
 		path[k].ep_index->ei_blk = htole32(border);
-		ext4_ext_dirty(ip, path + k);
+		error = ext4_ext_dirty(ip, path + k);
+		if (error)
+			return (error);
 	}
 
 	return (0);
 }
 
+/*
+ * ext4_ext_insert_extent — insert a new extent into the extent tree.
+ *
+ * If ctx is non-NULL, the context's state is advanced to MAPPED
+ * and then PUBLISHED upon successful write of the modified extent
+ * tree block to disk.  A partial failure (e.g., ext4_ext_dirty
+ * returning an error after in-memory modifications) leaves the
+ * context in MAPPED state — unpublished — so the caller's rollback
+ * path will correctly reverse the allocation.
+ *
+ * If ctx is NULL (e.g., truncate or split paths that don't go
+ * through the allocation context), the function operates in legacy
+ * mode without state tracking.
+ */
 static int
 ext4_ext_insert_extent(struct inode *ip, struct ext4_extent_path *path,
-    struct ext4_extent *newext)
+     struct ext4_extent *newext, struct ext2_alloc_context *ctx)
 {
 	struct ext4_extent_header * eh;
 	struct ext4_extent *ex, *nex, *nearex;
@@ -1347,7 +1403,26 @@ merge:
 	if (error)
 		goto cleanup;
 
-	ext4_ext_dirty(ip, path + depth);
+	error = ext4_ext_dirty(ip, path + depth);
+	if (error)
+		goto cleanup;
+
+	/*
+	 * The extent record has been successfully written to disk.
+	 * If the caller provided an allocation context, advance it
+	 * through the MAPPED and PUBLISHED transitions to reflect
+	 * that the block pointer is now reachable from on-disk inode
+	 * metadata.
+	 *
+	 * ext4_ext_dirty() calls bwrite() internally — if bwrite()
+	 * succeeded (error == 0), the metadata is durable.  The
+	 * PUBLISHED transition is only applied on success; a failure
+	 * leaves the context in MAPPED state, eligible for rollback.
+	 */
+	if (ctx) {
+		ext2_alloc_transition(ctx, EXT2_ALLOC_MAPPED);
+		ext2_alloc_transition(ctx, EXT2_ALLOC_PUBLISHED);
+	}
 
 cleanup:
 	if (npath) {
@@ -1361,29 +1436,74 @@ cleanup:
 
 static e4fs_daddr_t
 ext4_new_blocks(struct inode *ip, daddr_t lbn, e4fs_daddr_t pref,
-    struct ucred *cred, unsigned long *count, int *perror)
+    struct ucred *cred, unsigned long *count, int *perror,
+    struct ext2_alloc_context *ctx)
 {
-	struct m_ext2fs *fs;
-	e4fs_daddr_t newblk;
+	int error;
 
-	/*
-	 * We will allocate only single block for now.
-	 */
-	if (*count > 1)
+	if (ctx == NULL) {
+		*perror = EINVAL;
 		return (0);
-
-	fs = ip->i_e2fs;
-	EXT2_LOCK(ip->i_ump);
-	*perror = ext2_alloc(ip, lbn, pref, (int)fs->e2fs_bsize, cred, &newblk);
-	if (*perror)
-		return (0);
-
-	if (newblk) {
-		ip->i_flag |= IN_CHANGE | IN_UPDATE;
-		ext2_update(ip->i_vnode, 1);
 	}
 
-	return (newblk);
+	if (*count <= 0)
+		return (0);
+
+	/*
+	 * ext2_alloc_run() returns exactly one contiguous run.
+	 * Cap the requested count to a sane maximum so we never
+	 * request more blocks than an extent can record.
+	 */
+	if (*count > EXT4_MAX_LEN)
+		*count = EXT4_MAX_LEN;
+
+	EXT2_LOCK(ip->i_ump);
+	/*
+	 * ext2_alloc_run() enforces the reserved-block policy
+	 * and free-blocks check internally; no caller-side checks needed.
+	 */
+	{
+		enum ext2_alloc_class alloc_class;
+
+		if (lbn == (daddr_t)ip->i_next_alloc_block + 1)
+			alloc_class = EXT2_ALLOC_DATA_SEQ;
+		else
+			alloc_class = EXT2_ALLOC_DATA_RAND;
+		error = ext2_alloc_run(ip, lbn, (uint32_t)*count, pref,
+		    alloc_class, cred, ctx);
+	}
+	/*
+	 * Lock contract: ext2_alloc_run returns with EXT2_LOCK held.
+	 * On failure, goto nospace (which unlocks).
+	 */
+	if (error)
+		goto nospace;
+
+	/*
+	 * ext2_alloc_run succeeded; lock is still held.
+	 * Commit inode accounting (i_blocks, hints, flags) while
+	 * the lock is held — ext2_commit_allocated_block modifies
+	 * i_blocks, i_next_alloc_block/goal, and i_flag.
+	 */
+	*count = ctx->run.par_length;
+	ext2_commit_allocated_block(ip, ctx);
+	*perror = 0;
+	EXT2_UNLOCK(ip->i_ump);
+
+	/*
+	 * ext2_update() performs a synchronous write via bwrite(), which
+	 * can sleep (g_vfs_strategy -> uma_zalloc).  It must NOT be called
+	 * with EXT2_LOCK held — release the lock first.  All in-memory
+	 * inode state was already updated under the lock by
+	 * ext2_commit_allocated_block() above.
+	 */
+	ext2_update(ip->i_vnode, 1);
+	return (ctx->run.par_physical_start);
+nospace:
+	mtx_assert(EXT2_MTX(ip->i_ump), MA_OWNED);
+	EXT2_UNLOCK(ip->i_ump);
+	*perror = ENOSPC;
+	return (0);
 }
 
 int
@@ -1395,10 +1515,12 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 	struct buf *bp = NULL;
 	struct ext4_extent_path *path;
 	struct ext4_extent newex, *ex;
+	struct ext2_alloc_context ctx;
 	e4fs_daddr_t bpref, newblk = 0;
 	unsigned long allocated = 0;
 	int error = 0, depth;
 
+	fs = ip->i_e2fs;
 	if(bpp)
 		*bpp = NULL;
 	*pallocated = 0;
@@ -1454,7 +1576,8 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 
 	bpref = ext4_ext_blkpref(ip, path, iblk);
 	allocated = max_blocks;
-	newblk = ext4_new_blocks(ip, iblk, bpref, cred, &allocated, &error);
+	newblk = ext4_new_blocks(ip, iblk, bpref, cred, &allocated, &error,
+	    &ctx);
 	if (!newblk)
 		goto out2;
 
@@ -1462,21 +1585,60 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 	newex.e_blk = htole32(iblk);
 	ext4_ext_store_pblock(&newex, newblk);
 	newex.e_len = htole16(allocated);
-	error = ext4_ext_insert_extent(ip, path, &newex);
-	if (error)
+	error = ext4_ext_insert_extent(ip, path, &newex, &ctx);
+	if (error) {
+		/*
+		 * Extent insertion failed after physical blocks were
+		 * allocated and i_blocks was updated by ext4_new_blocks()
+		 * via ext2_commit_allocated_block().
+		 *
+		 * Invariant: the blocks are unpublished.  ext4_new_blocks()
+		 * populated 'ctx' with the allocated run and committed
+		 * i_blocks accounting, but ext4_ext_insert_extent() failed
+		 * before installing the extent record into the on-disk
+		 * extent tree.  No pointer from inode metadata references
+		 * these blocks.
+		 *
+		 * Therefore this is an allocation rollback, not a
+		 * consistency repair.  The context has accounting_applied=
+		 * true (set by ext2_commit_allocated_block) and state=
+		 * ALLOCATED (set by ext2_alloc_run).  ROLLBACK is
+		 * permitted from ALLOCATED state.
+		 */
+#ifdef INVARIANTS
+		if (allocated == 0)
+			panic("ext4_ext_get_blocks: extent insertion failed "
+			    "with allocated == 0");
+		if (newblk == 0)
+			panic("ext4_ext_get_blocks: extent insertion failed "
+			    "with newblk == 0");
+#endif
+		ext2_rollback_allocation(&ctx);
 		goto out2;
+	}
 
+	/*
+	 * MAPPED/PUBLISHED transitions were recorded inside
+	 * ext4_ext_insert_extent() via the propagated context on
+	 * the success path of ext4_ext_dirty().
+	 */
 	newblk = ext4_ext_extent_pblock(&newex);
 	ext4_ext_put_in_cache(ip, iblk, allocated, newblk, EXT4_EXT_CACHE_IN);
 	*pallocated = 1;
 
 out:
+	/*
+	 * On success path: 'path' still holds no buffer references (all
+	 * were released inside ext4_ext_find_extent).  The data buffer
+	 * bp is freshly bread()'d below for the caller; ownership is
+	 * transferred to *bpp on success, or released via brelse() on
+	 * error.
+	 */
 	if (allocated > max_blocks)
 		allocated = max_blocks;
 
 	if (bpp)
 	{
-		fs = ip->i_e2fs;
 		error = bread(ip->i_devvp, fsbtodb(fs, newblk),
 		    fs->e2fs_bsize, cred, &bp);
 		if (error) {
@@ -1487,6 +1649,14 @@ out:
 	}
 
 out2:
+	/*
+	 * Path ownership: 'path' holds malloc'd ep_data copies but NO
+	 * buffer references (all bread/bqrelse pairs are balanced inside
+	 * ext4_ext_find_extent).  If ext4_ext_insert_extent() called
+	 * ext4_ext_dirty(), the buffer was acquired via getblk/internal
+	 * bread, written via bwrite (which releases), and is no longer
+	 * held.  Freeing the path here is therefore buffer-safe.
+	 */
 	if (path) {
 		ext4_ext_drop_refs(path);
 		free(path, M_EXT2EXTENTS);
@@ -1535,7 +1705,8 @@ ext4_ext_rm_index(struct inode *ip, struct ext4_extent_path *path)
 	    ("ext4_ext_rm_index: bad ecount"));
 	path->ep_header->eh_ecount =
 	    htole16(le16toh(path->ep_header->eh_ecount) - 1);
-	ext4_ext_dirty(ip, path);
+	if (ext4_ext_dirty(ip, path) != 0)
+		return (EIO);
 	ext4_ext_blkfree(ip, leaf, 1, 0);
 	return (0);
 }
@@ -1609,7 +1780,9 @@ ext4_ext_rm_leaf(struct inode *ip, struct ext4_extent_path *path,
 		ex->e_blk = htole32(block);
 		ex->e_len = htole16(num);
 
-		ext4_ext_dirty(ip, path + depth);
+		error = ext4_ext_dirty(ip, path + depth);
+		if (error)
+			goto out;
 
 		ex--;
 		ex_blk = htole32(ex->e_blk);
@@ -1764,9 +1937,12 @@ ext4_ext_remove_space(struct inode *ip, off_t length, int flags,
 		 */
 		 ext4_ext_header(ip)->eh_depth = 0;
 		 ext4_ext_header(ip)->eh_max = htole16(ext4_ext_space_root(ip));
-		 ext4_ext_dirty(ip, path);
+		 error = ext4_ext_dirty(ip, path);
+		 if (error)
+			 goto out;
 	}
 
+out:
 	ext4_ext_drop_refs(path);
 	free(path, M_EXT2EXTENTS);
 
