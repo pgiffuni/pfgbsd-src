@@ -52,6 +52,7 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_mount.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 
@@ -169,15 +170,23 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 				ext2_rollback_unpublished(ip, newb, 1);
 				return (EFBIG);
 			}
-			bp = getblk(vp, lbn, fs->e2fs_bsize, 0, 0, 0);
-			bp->b_blkno = fsbtodb(fs, newb);
-			if (flags & BA_CLRBUF)
-				vfs_bio_clrbuf(bp);
+bp = getblk(vp, lbn, fs->e2fs_bsize, 0, 0, 0);
+		bp->b_blkno = fsbtodb(fs, newb);
+		if (flags & BA_CLRBUF)
+			vfs_bio_clrbuf(bp);
+	}
+	ip->i_db[lbn] = dbtofsb(fs, bp->b_blkno);
+	ip->i_flag |= IN_CHANGE | IN_UPDATE;
+
+	/* Register ALLOCDIRECT for the newly mapped direct block */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOCDIRECT);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
 		}
-		ip->i_db[lbn] = dbtofsb(fs, bp->b_blkno);
-		ip->i_flag |= IN_CHANGE | IN_UPDATE;
-		*bpp = bp;
-		return (0);
+	}
+	*bpp = bp;
+	return (0);
 	}
 	/*
 	 * Determine the number of levels of indirection.
@@ -215,20 +224,31 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		bp->b_blkno = fsbtodb(fs, pref);
 		vfs_bio_clrbuf(bp);
 		/*
-		 * Write synchronously so that indirect blocks
-		 * never point at garbage.
+		 * Indirect block write with dependency control.
+		 * If INDIRDEP is satisfied, write asynchronously.
+		 * Otherwise defer until INDIRDEP satisfied.
 		 */
-		if ((error = bwrite(bp)) != 0) {
-			/*
-			 * bwrite failed after allocating the indirect block.
-			 * The block is unpublished: pref was set but not yet
-			 * stored in ip->i_ib[].  bwrite already released bp.
-			 */
-			ext2_rollback_unpublished(ip, pref, 1);
-			return (error);
+		if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+			if (bp->b_dep == NULL && ip->i_inodedep != NULL) {
+				bp->b_dep = &ip->i_inodedep->id_dep;
+			}
+			ext2_defer_buffer_write(bp, bp->b_dep);
+		} else {
+			if ((error = bwrite(bp)) != 0) {
+				ext2_rollback_unpublished(ip, pref, 1);
+				return (error);
+			}
 		}
 		ip->i_ib[indirs[0].in_off] = pref;
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
+
+		/* Register INDIRDEP for the newly allocated indirect block */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_INDIRDEP);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
 	}
 	/*
 	 * Fetch through the indirect blocks, allocating as necessary.
@@ -272,42 +292,50 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		nbp->b_blkno = fsbtodb(fs, pref);
 		vfs_bio_clrbuf(nbp);
 		/*
-		 * Write synchronously so that indirect blocks
-		 * never point at garbage.
+		 * Middle indirect block write with dependency control.
 		 */
-		if ((error = bwrite(nbp)) != 0) {
-			/*
-			 * bwrite failed after allocating the indirect block.
-			 * The block is unpublished (pref not yet stored in
-			 * bap[]).  bwrite already released nbp; bp is still
-			 * held as the parent indirect block and must be
-			 * released.
-			 */
-			ext2_rollback_unpublished(ip, pref, 1);
-			brelse(bp);
-			return (error);
+		if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(nbp)) {
+			if (nbp->b_dep == NULL && ip->i_inodedep != NULL) {
+				nbp->b_dep = &ip->i_inodedep->id_dep;
+			}
+			ext2_defer_buffer_write(nbp, nbp->b_dep);
+		} else {
+			if ((error = bwrite(nbp)) != 0) {
+				ext2_rollback_unpublished(ip, pref, 1);
+				brelse(bp);
+				return (error);
+			}
 		}
 		bap[indirs[i - 1].in_off] = htole32(pref);
+
+		/* Register INDIRDEP for the newly allocated middle indirect block */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_INDIRDEP);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
 		/*
-		 * If required, write synchronously, otherwise use
+		 * If required, write with dependency control, otherwise use
 		 * delayed write.  bwrite() and bdwrite() both release
 		 * 'bp' internally; the loop re-assigns bp via bread()
 		 * at the top of the next iteration.
 		 */
 		if (flags & IO_SYNC) {
-			if ((error = bwrite(bp)) != 0) {
-				/*
-				 * bwrite of the parent indirect block
-				 * failed after the child indirect block
-				 * (pref) was allocated, i_blocks was
-				 * incremented, and the child was written.
-				 * The child is now orphaned: it exists on
-				 * disk but is not reachable from the
-				 * inode.  Roll it back.
-				 */
-				ext2_rollback_unpublished(ip, pref, 1);
-				bp = NULL;
-				return (error);
+			/*
+			 * Parent indirect block write with dependency control.
+			 */
+			if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+				if (bp->b_dep == NULL && ip->i_inodedep != NULL) {
+					bp->b_dep = &ip->i_inodedep->id_dep;
+				}
+				ext2_defer_buffer_write(bp, bp->b_dep);
+			} else {
+				if ((error = bwrite(bp)) != 0) {
+					ext2_rollback_unpublished(ip, pref, 1);
+					bp = NULL;
+					return (error);
+				}
 			}
 		} else {
 			if (bp->b_bufsize == fs->e2fs_bsize)
@@ -367,6 +395,15 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		if (flags & BA_CLRBUF)
 			vfs_bio_clrbuf(nbp);
 		bap[indirs[i].in_off] = htole32(pref);
+
+		/* Register ALLOCDIRECT for the newly mapped data block */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOCDIRECT);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
+
 		ext2_alloc_transition(&ctx, EXT2_ALLOC_MAPPED);
 		/*
 		 * If required, write synchronously, otherwise use

@@ -52,6 +52,7 @@
 #include <fs/ext2fs/ext2_mount.h>
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DEFINE(ext2fs);
 /*
@@ -457,6 +458,14 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 			ctxp->run.par_length = desired_len;
 			ctxp->state = EXT2_ALLOC_ALLOCATED;
 			error = 0;
+
+			/* Register NEWBLK dependency for the newly allocated blocks */
+			if (ip->i_e2fs->e2fs_softdep != NULL) {
+				struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_NEWBLK);
+				if (dep != NULL) {
+					dep->dep_parent = NULL;
+				}
+			}
 			goto out;
 		}
 		/*
@@ -494,6 +503,14 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 		ctxp->run.par_length = 1;
 		ctxp->state = EXT2_ALLOC_ALLOCATED;
 		error = 0;
+
+		/* Register NEWBLK dependency for the newly allocated block */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_NEWBLK);
+			if (dep != NULL) {
+				dep->dep_parent = NULL; /* No parent for initial allocation */
+			}
+		}
 		goto out;
 	}
 #ifdef INVARIANTS
@@ -823,6 +840,14 @@ ext2_commit_allocated_block(struct inode *ip,
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
 
 	ctxp->accounting_applied = true;
+
+	/* Register INODEDEP for inode accounting update */
+	if (ip->i_e2fs->e2fs_softdep != NULL && ip->i_inodedep == NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_INODEDEP);
+		if (dep != NULL) {
+			ip->i_inodedep = (struct ext2_inodedep *)dep;
+		}
+	}
 }
 
 /*
@@ -2273,6 +2298,23 @@ ext2_blkfree(struct inode *ip, e4fs_daddr_t bno, long size)
 	fs->e2fs_fmod = 1;
 	EXT2_UNLOCK(ump);
 	ext2_gd_b_bitmap_csum_set(fs, cg, bp);
+
+	/* Register BMSAFEMAP dependency for block bitmap update */
+	if (fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(fs->e2fs_softdep, EXT2_DEP_BMSAFEMAP);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
+	/*
+	 * Block bitmap update with dependency control.
+	 */
+	if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		ext2_defer_buffer_write(bp, bp->b_dep);
+		return;
+	}
+
 	bdwrite(bp);
 }
 
@@ -2325,6 +2367,23 @@ ext2_vfree(struct vnode *pvp, ino_t ino, int mode)
 	fs->e2fs_fmod = 1;
 	EXT2_UNLOCK(ump);
 	ext2_gd_i_bitmap_csum_set(fs, cg, bp);
+
+	/* Register BMSAFEMAP dependency for inode bitmap update */
+	if (fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(fs->e2fs_softdep, EXT2_DEP_BMSAFEMAP);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
+	/*
+	 * Inode bitmap update with dependency control.
+	 */
+	if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		ext2_defer_buffer_write(bp, bp->b_dep);
+		return (0);
+	}
+
 	bdwrite(bp);
 	return (0);
 }

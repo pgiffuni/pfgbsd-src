@@ -45,6 +45,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extents.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -827,6 +828,20 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 			return (EIO);
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
+
+		/* Check if buffer can be written (Soft Updates dependency control) */
+		if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+			/* Find and attach EXTENTDEP dependency for this block */
+			/* For now, defer the write - in a full implementation,
+			 * we would look up the EXTENTDEP by block number */
+			if (bp->b_dep == NULL && ip->i_inodedep != NULL) {
+				bp->b_dep = &ip->i_inodedep->id_dep;
+			}
+			ext2_defer_buffer_write(bp, bp->b_dep);
+			brelse(bp);
+			return (0);
+		}
+
 		error = bwrite(bp);
 		if (error) {
 			/*
@@ -1407,6 +1422,14 @@ merge:
 	if (error)
 		goto cleanup;
 
+	/* Register EXTENTDEP for the modified extent tree block */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_EXTENTDEP);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	/*
 	 * The extent record has been successfully written to disk.
 	 * If the caller provided an allocation context, advance it
@@ -1488,6 +1511,15 @@ ext4_new_blocks(struct inode *ip, daddr_t lbn, e4fs_daddr_t pref,
 	 */
 	*count = ctx->run.par_length;
 	ext2_commit_allocated_block(ip, ctx);
+
+	/* Register ALLOCEXTENT for the newly allocated extent */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOCEXTENT);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	*perror = 0;
 	ext2_update(ip->i_vnode, 1);
 	EXT2_UNLOCK(ip->i_ump);

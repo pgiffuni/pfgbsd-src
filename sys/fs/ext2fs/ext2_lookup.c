@@ -1049,6 +1049,26 @@ ext2_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry)
 	}
 	bcopy((caddr_t)entry, (caddr_t)ep, (u_int)newentrysize);
 	ext2_dirent_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
+
+	/* Register DIRADD dependency for directory entry write */
+	if (dp->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(dp->i_e2fs->e2fs_softdep, EXT2_DEP_DIRADD);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
+	/*
+	 * Directory entry write with dependency control.
+	 */
+	if (dp->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		if (bp->b_dep == NULL && dp->i_inodedep != NULL) {
+			bp->b_dep = &dp->i_inodedep->id_dep;
+		}
+		ext2_defer_buffer_write(bp, bp->b_dep);
+		return (0);
+	}
+
 	if (DOINGASYNC(dvp)) {
 		bdwrite(bp);
 		error = 0;
@@ -1109,10 +1129,32 @@ ext2_dirremove(struct vnode *dvp, struct componentname *cnp)
 		    le16toh(ep->e2d_reclen));
 	ep->e2d_reclen += rep->e2d_reclen;
 	ext2_dirent_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
+
+	/* Register DIRREM dependency for directory entry write */
+	if (dp->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(dp->i_e2fs->e2fs_softdep, EXT2_DEP_DIRREM);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
+	/*
+	 * Directory entry removal write with dependency control.
+	 */
+	if (dp->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		ext2_defer_buffer_write(bp, bp->b_dep);
+		return (0);
+	}
+
 	if (DOINGASYNC(dvp) && dp->i_count != 0)
 		bdwrite(bp);
-	else
+	else {
+		if (dp->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+			ext2_defer_buffer_write(bp, bp->b_dep);
+			return (0);
+		}
 		error = bwrite(bp);
+	}
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
 	return (error);
 }
@@ -1140,6 +1182,23 @@ ext2_dirrewrite(struct inode *dp, struct inode *ip, struct componentname *cnp)
 	else
 		ep->e2d_type = EXT2_FT_UNKNOWN;
 	ext2_dirent_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
+
+	/* Register DIRADD dependency for directory entry rewrite */
+	if (dp->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(dp->i_e2fs->e2fs_softdep, EXT2_DEP_DIRADD);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
+	/*
+	 * Directory entry rewrite with dependency control.
+	 */
+	if (dp->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		ext2_defer_buffer_write(bp, bp->b_dep);
+		return (0);
+	}
+
 	error = bwrite(bp);
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
 	return (error);

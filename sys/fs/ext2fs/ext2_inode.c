@@ -95,9 +95,28 @@ ext2_update(struct vnode *vp, int waitfor)
 		brelse(bp);
 		return (error);
 	}
-	if (waitfor && !DOINGASYNC(vp))
+
+	/* Attach inode dependency to buffer for Soft Updates write ordering */
+	if (fs->e2fs_softdep != NULL && ip->i_inodedep != NULL) {
+		bp->b_dep = &ip->i_inodedep->id_dep;
+	}
+
+	/*
+	 * Inode update with dependency control.
+	 * If INODEDEP is satisfied, write asynchronously.
+	 * Otherwise defer until INODEDEP satisfied.
+	 */
+	if (waitfor && !DOINGASYNC(vp)) {
+		if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+			ext2_defer_buffer_write(bp, bp->b_dep);
+			return (0);
+		}
 		return (bwrite(bp));
-	else {
+	} else {
+		if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+			ext2_defer_buffer_write(bp, bp->b_dep);
+			return (0);
+		}
 		bdwrite(bp);
 		return (0);
 	}
@@ -564,6 +583,14 @@ ext2_truncate(struct vnode *vp, off_t length, int flags, struct ucred *cred,
 		return (EINVAL);
 
 	ip = VTOI(vp);
+
+	/* Register FREEBLKS dependency for blocks being freed */
+	if (ip->i_e2fs->e2fs_softdep != NULL && ip->i_size > length) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_FREEBLKS);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
 	if (vp->v_type == VLNK &&
 	    ip->i_size < VFSTOEXT2(vp->v_mount)->um_e2fs->e2fs_maxsymlinklen) {
 #ifdef INVARIANTS
@@ -607,6 +634,15 @@ ext2_inactive(struct vop_inactive_args *ap)
 		goto out;
 	if (ip->i_nlink <= 0) {
 		ext2_extattr_free(ip);
+
+		/* Register FREEFILE dependency for inode deallocation */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_FREEFILE);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
+
 		error = ext2_truncate(vp, (off_t)0, 0, NOCRED, td);
 		ip->i_rdev = 0;
 		mode = ip->i_mode;
@@ -640,6 +676,13 @@ ext2_reclaim(struct vop_reclaim_args *ap)
 		ip->i_flag |= IN_MODIFIED;
 		ext2_update(vp, 0);
 	}
+
+	/* Clean up Soft Updates inode dependency */
+	if (ip->i_inodedep != NULL) {
+		/* Inodedep should be cleaned up by softdep_unmount */
+		ip->i_inodedep = NULL;
+	}
+
 	vfs_hash_remove(vp);
 	free(vp->v_data, M_EXT2NODE);
 	vp->v_data = 0;

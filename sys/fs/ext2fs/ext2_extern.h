@@ -418,4 +418,15 @@ void	ext2_gd_csum_set(struct m_ext2fs *);
 extern struct vop_vector ext2_vnodeops;
 extern struct vop_vector ext2_fifoops;
 
+/* ext2 Soft Updates declarations */
+int	ext2_softdep_mount(struct mount *, struct m_ext2fs *);
+void	ext2_softdep_unmount(struct mount *);
+void	ext2_softdep_initialize(void);
+void	ext2_softdep_uninitialize(void);
+
+int	ext2_orphan_add(struct inode *);
+int	ext2_orphan_remove(struct inode *);
+void	ext2_orphan_recovery(struct mount *);
+int	ext2_sbupdate(struct ext2mount *, int);
+
 #endif	/* !_FS_EXT2FS_EXT2_EXTERN_H_ */

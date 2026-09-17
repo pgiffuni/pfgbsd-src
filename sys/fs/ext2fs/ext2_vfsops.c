@@ -64,6 +64,7 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_extents.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -90,6 +91,7 @@ static vfs_mount_t		ext2_mount;
 
 MALLOC_DEFINE(M_EXT2NODE, "ext2_node", "EXT2 vnode private part");
 static MALLOC_DEFINE(M_EXT2MNT, "ext2_mount", "EXT2 mount structure");
+static MALLOC_DEFINE(M_EXT2SOFTDEP, "ext2_softdep", "EXT2 Soft Updates state");
 
 static struct vfsops ext2fs_vfsops = {
 	.vfs_fhtovp =		ext2_fhtovp,
@@ -964,6 +966,16 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	ump->um_cp = cp;
 
 	/*
+	 * Initialize Soft Updates if not read-only.
+	 */
+	if (ronly == 0) {
+		if ((error = ext2_softdep_mount(mp, fs)) != 0)
+			goto out;
+		/* Recover orphan list if any */
+		ext2_orphan_recovery(mp);
+	}
+
+	/*
 	 * Setting those two parameters allowed us to use
 	 * ufs_bmap w/o changse!
 	 */
@@ -1017,11 +1029,17 @@ ext2_unmount(struct mount *mp, int mntflags)
 			return (EINVAL);
 		flags |= FORCECLOSE;
 	}
-	if ((error = ext2_flushfiles(mp, flags, curthread)) != 0)
-		return (error);
+
+	/*
+	 * Shutdown Soft Updates before flushing files.
+	 */
 	ump = VFSTOEXT2(mp);
 	fs = ump->um_e2fs;
-	ronly = fs->e2fs_ronly;
+	if (fs->e2fs_softdep != NULL)
+		ext2_softdep_unmount(mp);
+
+	if ((error = ext2_flushfiles(mp, flags, curthread)) != 0)
+		return (error);
 	if (ronly == 0 && ext2_cgupdate(ump, MNT_WAIT) == 0) {
 		if (fs->e2fs_wasvalid)
 			fs->e2fs->e2fs_state =
@@ -1173,6 +1191,13 @@ loop:
 	}
 
 	/*
+	 * Process Soft Updates worklists to satisfy dependencies.
+	 */
+	if (fs->e2fs_softdep != NULL) {
+		ext2_worklist_process(fs->e2fs_softdep);
+	}
+
+	/*
 	 * Write back modified superblock.
 	 */
 	if (fs->e2fs_fmod != 0) {
@@ -1260,6 +1285,7 @@ ext2_vget(struct mount *mp, ino_t ino, int flags, struct vnode **vpp)
 	ip->i_block_group = ino_to_cg(fs, ino);
 	ip->i_next_alloc_block = 0;
 	ip->i_next_alloc_goal = 0;
+	ip->i_inodedep = NULL;
 
 	/*
 	 * Now we want to make sure that block pointers for unused
@@ -1352,7 +1378,7 @@ ext2_fhtovp(struct mount *mp, struct fid *fhp, int flags, struct vnode **vpp)
 /*
  * Write a superblock and associated information back to disk.
  */
-static int
+int
 ext2_sbupdate(struct ext2mount *mp, int waitfor)
 {
 	struct m_ext2fs *fs = mp->um_e2fs;
@@ -1380,6 +1406,30 @@ ext2_sbupdate(struct ext2mount *mp, int waitfor)
 
 	memcpy((char *)bp->b_data + SBLOCKOFFSET, (caddr_t)es,
 	    (u_int)sizeof(struct ext2fs));
+
+	/* Register SBDEP for superblock update */
+	if (fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(fs->e2fs_softdep, EXT2_DEP_SBDEP);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
+	/*
+	 * Superblock update with dependency control.
+	 */
+	if (fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		if (bp->b_dep == NULL) {
+			/* Need to attach SBDEP to buffer */
+			/* For now, we don't have a direct way to find SBDEP,
+			 * so defer anyway and let it be written later */
+			ext2_defer_buffer_write(bp, bp->b_dep);
+		} else {
+			ext2_defer_buffer_write(bp, bp->b_dep);
+		}
+		return (0);
+	}
+
 	if (waitfor == MNT_WAIT)
 		error = bwrite(bp);
 	else

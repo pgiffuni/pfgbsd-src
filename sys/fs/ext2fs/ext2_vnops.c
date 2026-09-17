@@ -89,6 +89,7 @@
 #include <fs/ext2fs/ext2_mount.h>
 #include <fs/ext2fs/ext2_extattr.h>
 #include <fs/ext2fs/ext2_extents.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -688,6 +689,22 @@ ext2_remove(struct vop_remove_args *ap)
 	if (error == 0) {
 		ip->i_nlink--;
 		ip->i_flag |= IN_CHANGE;
+
+		/* Register DIRREM dependency for directory entry removal */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_DIRREM);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
+
+		/* If link count reaches zero, register ORPHAN_ADD */
+		if (ip->i_nlink <= 0 && ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ORPHAN_ADD);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
 	}
 out:
 	return (error);
@@ -722,6 +739,14 @@ ext2_link(struct vop_link_args *ap)
 	if (error) {
 		ip->i_nlink--;
 		ip->i_flag |= IN_CHANGE;
+	} else {
+		/* Register DIRADD dependency for new directory entry */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_DIRADD);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
 	}
 out:
 	return (error);
@@ -1359,6 +1384,14 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 		ip->i_flags |= UF_OPAQUE;
 	error = ext2_update(tvp, 1);
 
+	/* Register MKDIR dependency for new directory creation */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_MKDIR);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	/*
 	 * Bump link count in parent directory
 	 * to reflect work done below.  Should
@@ -1370,6 +1403,14 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 	error = ext2_update(dvp, !DOINGASYNC(dvp));
 	if (error)
 		goto bad;
+
+	/* Register DIRADD dependency for parent link count increment */
+	if (dp->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(dp->i_e2fs->e2fs_softdep, EXT2_DEP_DIRADD);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
 
 	/* Initialize directory with "." and ".." from static template. */
 	if (EXT2_HAS_INCOMPAT_FEATURE(ip->i_e2fs,
@@ -1428,6 +1469,14 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 	if (error) {
 		ext2_dec_nlink(dp);
 		dp->i_flag |= IN_CHANGE;
+	} else {
+		/* Register DIRADD dependency for child directory entry */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_DIRADD);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
 	}
 bad:
 	/*
@@ -1486,8 +1535,26 @@ ext2_rmdir(struct vop_rmdir_args *ap)
 	error = ext2_dirremove(dvp, cnp);
 	if (error)
 		goto out;
+
+	/* Register DIRREM dependency for directory entry removal */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_DIRREM);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	ext2_dec_nlink(dp);
 	dp->i_flag |= IN_CHANGE;
+
+	/* Register ORPHAN_ADD for directory inode (link count goes to 0) */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ORPHAN_ADD);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	cache_purge(dvp);
 	VOP_UNLOCK(dvp);
 	/*
