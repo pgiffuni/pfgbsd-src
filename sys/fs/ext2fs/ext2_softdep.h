@@ -122,6 +122,18 @@ LIST_HEAD(ext2_dep_list, ext2_dep);
 TAILQ_HEAD(ext2_dep_tailq, ext2_dep);
 
 /*
+ * Deferred write item for buffers with unsatisfied dependencies
+ */
+struct ext2_deferred_write {
+	TAILQ_ENTRY(ext2_deferred_write) dw_list;
+	struct buf		*dw_bp;			/* Deferred buffer */
+	struct ext2_dep		*dw_dep;		/* Dependency blocking write */
+	void			(*dw_callback)(struct buf *, int); /* Completion callback */
+};
+
+TAILQ_HEAD(ext2_deferred_write_head, ext2_deferred_write);
+
+/*
  * Mount-private dependency state
  */
 struct ext2_softdep_mount {
@@ -132,6 +144,10 @@ struct ext2_softdep_mount {
 	struct ext2_dep_list	sd_worklist[EXT2_DEP_MAX];	/* Per-type worklists */
 	TAILQ_HEAD(, ext2_dep)	sd_all_deps;	/* All dependencies */
 
+	/* Deferred writes - buffers waiting for dependencies */
+	struct ext2_deferred_write_head sd_deferred_writes;
+	struct mtx		sd_deferred_lock;	/* Deferred write lock */
+
 	/* Orphan list state */
 	uint32_t		sd_orphan_head;	/* In-memory copy of s_last_orphan */
 	struct mtx		sd_orphan_lock;	/* Orphan list lock */
@@ -140,6 +156,8 @@ struct ext2_softdep_mount {
 	uint64_t		sd_deps_allocated;
 	uint64_t		sd_deps_freed;
 	uint64_t		sd_workitems_processed;
+	uint64_t		sd_writes_deferred;
+	uint64_t		sd_writes_completed;
 
 	/* Shutdown state */
 	bool			sd_shutting_down;	/* Unmount in progress */
@@ -420,6 +438,16 @@ void	ext2_buf_write_complete(struct buf *bp, int error);
 int	ext2_orphan_add(struct inode *ip);
 int	ext2_orphan_remove(struct inode *ip);
 void	ext2_orphan_recovery(struct mount *mp);
+
+/* Inode dependency lookup */
+struct ext2_inodedep *ext2_inodedep_lookup(struct ext2_softdep_mount *sd, ino_t ino);
+struct ext2_inodedep *ext2_inodedep_lookup_ip(struct inode *ip);
+
+/* Deferred write management */
+bool	ext2_can_write_buffer(struct buf *bp);
+void	ext2_defer_buffer_write(struct buf *bp, struct ext2_dep *dep);
+void	ext2_process_deferred_writes(struct ext2_softdep_mount *sd);
+void	ext2_flush_deferred_writes(struct ext2_softdep_mount *sd);
 
 /* Inode dependency lookup */
 struct ext2_inodedep *ext2_inodedep_lookup(struct ext2_softdep_mount *sd, ino_t ino);

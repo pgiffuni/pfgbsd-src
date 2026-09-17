@@ -105,10 +105,12 @@ ext2_softdep_mount(struct mount *mp, struct m_ext2fs *fs)
 	sd->sd_mp = mp;
 	mtx_init(&sd->sd_lock, "ext2sdlock", NULL, MTX_DEF);
 	mtx_init(&sd->sd_orphan_lock, "ext2orphlock", NULL, MTX_DEF);
+	mtx_init(&sd->sd_deferred_lock, "ext2deflock", MTX_DEF);
 
 	for (int i = 0; i < EXT2_DEP_MAX; i++)
 		LIST_INIT(&sd->sd_worklist[i]);
 	TAILQ_INIT(&sd->sd_all_deps);
+	TAILQ_INIT(&sd->sd_deferred_writes);
 
 	sd->sd_shutting_down = false;
 
@@ -140,6 +142,9 @@ ext2_softdep_unmount(struct mount *mp)
 	EXT2_SOFTDEP_LOCK(sd);
 	sd->sd_shutting_down = true;
 
+	/* Flush all deferred writes */
+	ext2_flush_deferred_writes(sd);
+
 	/* Process all pending work items */
 	ext2_worklist_process(sd);
 
@@ -155,6 +160,7 @@ ext2_softdep_unmount(struct mount *mp)
 
 	mtx_destroy(&sd->sd_lock);
 	mtx_destroy(&sd->sd_orphan_lock);
+	mtx_destroy(&sd->sd_deferred_lock);
 
 	VFSTOEXT2(mp)->e2fs_softdep = NULL;
 	free(sd, M_EXT2SOFTDEP);
@@ -329,6 +335,10 @@ ext2_dep_satisfy(struct ext2_dep *dep)
 	KASSERT(dep != NULL, ("ext2_dep_satisfy: NULL dep"));
 
 	ext2_dep_set_state(dep, EXT2_DEP_COMPLETE | EXT2_DEP_DEPCOMPLETE);
+
+	/* Process any deferred writes waiting for this dependency */
+	if (dep->dep_mp != NULL)
+		ext2_process_deferred_writes(dep->dep_mp);
 
 	/* If all complete and no references, free */
 	if (ext2_dep_is_complete(dep) && dep->dep_refcnt == 1) {
@@ -665,6 +675,134 @@ ext2_orphan_recovery(struct mount *mp)
 		fs->e2fs_fmod = 1;
 		ext2_update(ITOV(fs->e2fs->e2fs_root), 1);
 	}
+}
+
+if (fs->e2fs.e3fs_last_orphan == 0) {
+		fs->e2fs_fmod = 1;
+		ext2_update(ITOV(fs->e2fs->e2fs_root), 1);
+	}
+}
+
+/*
+ * Deferred write management
+ */
+
+/*
+ * Check if a buffer can be written. Returns true if the buffer has
+ * no blocking dependencies, false if it should be deferred.
+ */
+bool
+ext2_can_write_buffer(struct buf *bp)
+{
+	if (bp->b_dep == NULL)
+		return (true);
+
+	struct ext2_dep *dep = bp->b_dep;
+
+	/* If dependency is complete or cancelled, allow write */
+	if (ext2_dep_is_complete(dep) || (dep->dep_state & EXT2_DEP_CANCELLED))
+		return (true);
+
+	/* If dependency is attached and not being written, block */
+	if (dep->dep_state & EXT2_DEP_ATTACHED)
+		return (false);
+
+	return (true);
+}
+
+/*
+ * Defer a buffer write due to unsatisfied dependency.
+ * The buffer will be written when the dependency is satisfied.
+ */
+void
+ext2_defer_buffer_write(struct buf *bp, struct ext2_dep *dep)
+{
+	struct ext2_softdep_mount *sd = dep->dep_mp;
+	struct ext2_deferred_write *dw;
+
+	KASSERT(bp != NULL && dep != NULL, ("ext2_defer_buffer_write: NULL args"));
+	KASSERT(dep->dep_mp != NULL, ("ext2_defer_buffer_write: NULL mount"));
+
+	/* Attach dependency to buffer if not already attached */
+	if (bp->b_dep == NULL)
+		bp->b_dep = dep;
+
+	dw = malloc(sizeof(*dw), M_EXT2SOFTDEP, M_WAITOK | M_ZERO);
+	if (dw == NULL) {
+		/* Allocation failed - force write anyway */
+		return;
+	}
+
+	dw->dw_bp = bp;
+	dw->dw_dep = dep;
+	dw->dw_callback = NULL; /* Will be called by normal completion */
+
+	mtx_lock(&dep->dep_mp->sd_deferred_lock);
+	TAILQ_INSERT_TAIL(&dep->dep_mp->sd_deferred_writes, dw, dw_list);
+	dep->dep_mp->sd_writes_deferred++;
+	mtx_unlock(&dep->dep_mp->sd_deferred_lock);
+}
+
+/*
+ * Process deferred writes whose dependencies are now satisfied.
+ * Called from ext2_dep_satisfy() and worklist processing.
+ */
+void
+ext2_process_deferred_writes(struct ext2_softdep_mount *sd)
+{
+	struct ext2_deferred_write *dw, *next;
+
+	mtx_lock(&sd->sd_deferred_lock);
+
+	TAILQ_FOREACH_SAFE(dw, &sd->sd_deferred_writes, dw_list, next) {
+		if (dw->dw_dep == NULL || ext2_can_write_buffer(dw->dw_bp)) {
+			/* Dependency satisfied - write the buffer */
+			TAILQ_REMOVE(&sd->sd_deferred_writes, dw, dw_list);
+			sd->sd_writes_completed++;
+
+			struct buf *bp = dw->dw_bp;
+			free(dw, M_EXT2SOFTDEP);
+
+			/* Release the lock before writing */
+			mtx_unlock(&sd->sd_deferred_lock);
+
+			/* Write the buffer - use bawrite for async */
+			bawrite(bp);
+
+			mtx_lock(&sd->sd_deferred_lock);
+		}
+	}
+
+	mtx_unlock(&sd->sd_deferred_lock);
+}
+
+/*
+ * Flush all deferred writes - used during unmount/shutdown.
+ * Forces writes of all deferred buffers regardless of dependency state.
+ */
+void
+ext2_flush_deferred_writes(struct ext2_softdep_mount *sd)
+{
+	struct ext2_deferred_write *dw, *next;
+
+	mtx_lock(&sd->sd_deferred_lock);
+
+	TAILQ_FOREACH_SAFE(dw, &sd->sd_deferred_writes, dw_list, next) {
+		TAILQ_REMOVE(&sd->sd_deferred_writes, dw, dw_list);
+		sd->sd_writes_completed++;
+
+		struct buf *bp = dw->dw_bp;
+		free(dw, M_EXT2SOFTDEP);
+
+		mtx_unlock(&sd->sd_deferred_lock);
+
+		/* Force synchronous write for shutdown */
+		bwrite(bp);
+
+		mtx_lock(&sd->sd_deferred_lock);
+	}
+
+	mtx_unlock(&sd->sd_deferred_lock);
 }
 
 /*
