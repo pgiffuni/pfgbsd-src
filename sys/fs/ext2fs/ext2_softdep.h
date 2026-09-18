@@ -50,6 +50,7 @@ typedef enum ext2_dep_type {
 	EXT2_DEP_ALLOCINDIR,		/* Indirect block allocation */
 	EXT2_DEP_EXTENTDEP,		/* Extent tree node dependency */
 	EXT2_DEP_ALLOCEXTENT,		/* Extent allocation */
+	EXT2_DEP_ALLOC_MULTI,		/* Multi-block allocation run */
 
 	/* Inode dependencies */
 	EXT2_DEP_INODEDEP,		/* Inode update dependencies */
@@ -284,6 +285,18 @@ struct ext2_allocextent {
 	uint32_t	ae_len;			/* Extent length */
 	ufs_lbn_t	ae_lblk;		/* Logical block start */
 	ino_t		ae_ino;			/* Owning inode */
+};
+
+/* Multi-block allocation run */
+struct ext2_allocmulti {
+	struct ext2_dep	am_dep;			/* Base dependency */
+
+	/* Run identification */
+	daddr_t		am_pblk;		/* Physical block start */
+	uint32_t	am_len;			/* Run length in blocks */
+	ufs_lbn_t	am_lblk;		/* Logical block start */
+	ino_t		am_ino;			/* Owning inode */
+	enum ext2_alloc_class am_class;	/* Allocation class */
 };
 
 /* Block freeing from truncation */

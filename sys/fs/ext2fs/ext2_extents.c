@@ -975,6 +975,14 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 	fs = ip->i_e2fs;
 	bp = NULL;
 
+	/* Register ALLOC_MULTI dependency for the extent tree split */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOC_MULTI);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	/*
 	 * We will split at current extent for now.
 	 */
@@ -1085,8 +1093,18 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 			neh->eh_ecount = htole16(le16toh(neh->eh_ecount) + m);
 		}
 
-		ext2_extent_blk_csum_set(ip, bp->b_data);
-		error = bwrite(bp);
+ext2_extent_blk_csum_set(ip, bp->b_data);
+
+	/* Write new block with dependency control */
+	if (ip->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(bp)) {
+		if (bp->b_dep == NULL && ip->i_inodedep != NULL) {
+			bp->b_dep = &ip->i_inodedep->id_dep;
+		}
+		ext2_defer_buffer_write(bp, bp->b_dep);
+		return (0);
+	}
+
+	error = bwrite(bp);
 		bp = NULL;
 		if (error)
 			goto cleanup;
@@ -1140,6 +1158,14 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 
 	fs = ip->i_e2fs;
 	curpath = path;
+
+	/* Register ALLOC_MULTI dependency for the extent tree grow */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOC_MULTI);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
 
 	newblk = ext4_ext_alloc_meta(ip);
 	if (newblk == 0)

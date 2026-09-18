@@ -459,9 +459,9 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 			ctxp->state = EXT2_ALLOC_ALLOCATED;
 			error = 0;
 
-			/* Register NEWBLK dependency for the newly allocated blocks */
+			/* Register ALLOC_MULTI dependency for the multi-block run */
 			if (ip->i_e2fs->e2fs_softdep != NULL) {
-				struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_NEWBLK);
+				struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOC_MULTI);
 				if (dep != NULL) {
 					dep->dep_parent = NULL;
 				}
@@ -504,11 +504,14 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 		ctxp->state = EXT2_ALLOC_ALLOCATED;
 		error = 0;
 
-		/* Register NEWBLK dependency for the newly allocated block */
+		/* Register ALLOCDIRECT for data, NEWBLK for metadata */
 		if (ip->i_e2fs->e2fs_softdep != NULL) {
-			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_NEWBLK);
+			ext2_dep_type_t dep_type = (alloc_class == EXT2_ALLOC_DATA_SEQ ||
+						    alloc_class == EXT2_ALLOC_DATA_RAND) ?
+			    EXT2_DEP_ALLOCDIRECT : EXT2_DEP_NEWBLK;
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, dep_type);
 			if (dep != NULL) {
-				dep->dep_parent = NULL; /* No parent for initial allocation */
+				dep->dep_parent = NULL;
 			}
 		}
 		goto out;
@@ -1106,6 +1109,15 @@ ext2_reallocblks(struct vop_reallocblks_args *ap)
 	 */
 	SDT_PROBE3(ext2fs, , alloc, ext2_reallocblks_realloc,
 	    ip->i_number, start_lbn, end_lbn);
+
+	/* Register REALLOCBLKS dependency for the reallocation */
+	if (ip->i_e2fs->e2fs_softdep != NULL) {
+		struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_ALLOC_MULTI);
+		if (dep != NULL) {
+			dep->dep_parent = NULL;
+		}
+	}
+
 	blkno = newblk;
 	for (bap = &sbap[soff], i = 0; i < len; i++, blkno += fs->e2fs_fpb) {
 		if (i == ssize) {
@@ -1134,25 +1146,48 @@ ext2_reallocblks(struct vop_reallocblks_args *ap)
 	 * synchronous write only when it has been cleared.
 	 */
 	if (sbap != &ip->i_db[0]) {
-		if (doasyncfree)
-			bdwrite(sbp);
-		else
-			bwrite(sbp);
+		/* Indirect block write with dependency control */
+		if (ip->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(sbp)) {
+			if (sbp->b_dep == NULL && ip->i_inodedep != NULL) {
+				sbp->b_dep = &ip->i_inodedep->id_dep;
+			}
+			ext2_defer_buffer_write(sbp, sbp->b_dep);
+		} else {
+			if (doasyncfree)
+				bdwrite(sbp);
+			else
+				bwrite(sbp);
+		}
 	} else {
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
 		if (!doasyncfree)
 			ext2_update(vp, 1);
 	}
 	if (ssize < len) {
-		if (doasyncfree)
-			bdwrite(ebp);
-		else
-			bwrite(ebp);
+		/* End indirect block write with dependency control */
+		if (ip->i_e2fs->e2fs_softdep != NULL && !ext2_can_write_buffer(ebp)) {
+			if (ebp->b_dep == NULL && ip->i_inodedep != NULL) {
+				ebp->b_dep = &ip->i_inodedep->id_dep;
+			}
+			ext2_defer_buffer_write(ebp, ebp->b_dep);
+		} else {
+			if (doasyncfree)
+				bdwrite(ebp);
+			else
+				bwrite(ebp);
+		}
 	}
 	/*
 	 * Last, free the old blocks and assign the new blocks to the buffers.
 	 */
 	for (blkno = newblk, i = 0; i < len; i++, blkno += fs->e2fs_fpb) {
+		/* Register FREEBLKS for the old blocks being freed */
+		if (ip->i_e2fs->e2fs_softdep != NULL) {
+			struct ext2_dep *dep = ext2_dep_alloc(ip->i_e2fs->e2fs_softdep, EXT2_DEP_FREEBLKS);
+			if (dep != NULL) {
+				dep->dep_parent = NULL;
+			}
+		}
 		ext2_blkfree(ip, dbtofsb(fs, buflist->bs_children[i]->b_blkno),
 		    fs->e2fs_bsize);
 		buflist->bs_children[i]->b_blkno = fsbtodb(fs, blkno);
