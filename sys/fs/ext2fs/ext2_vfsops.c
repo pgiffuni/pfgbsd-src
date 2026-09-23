@@ -64,6 +64,7 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_extents.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -970,6 +971,17 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	ump->um_nindir = EXT2_ADDR_PER_BLOCK(fs);
 	ump->um_bptrtodb = le32toh(fs->e2fs->e2fs_log_bsize) + 1;
 	ump->um_seqinc = EXT2_FRAGS_PER_BLOCK(fs);
+
+	/*
+	 * Initialize softdep subsystem for this mount.
+	 */
+	if (ronly == 0) {
+		if (ext2_softdep_mount(mp, fs) != 0)
+			printf("ext2_softdep: mount initialization failed\n");
+		else
+			ext2_orphan_recovery(mp);
+	}
+
 	if (ronly == 0)
 		ext2_sbupdate(ump, MNT_WAIT);
 	/*
@@ -1028,6 +1040,10 @@ ext2_unmount(struct mount *mp, int mntflags)
 			    htole16(le16toh(fs->e2fs->e2fs_state) | E2FS_ISCLEAN);
 		ext2_sbupdate(ump, MNT_WAIT);
 	}
+
+	/* Tear down softdep state */
+	if (fs->e2fs_softdep != NULL)
+		ext2_softdep_unmount(ump);
 
 	g_topology_lock();
 	g_vfs_close(ump->um_cp);
@@ -1131,6 +1147,10 @@ ext2_sync(struct mount *mp, int waitfor)
 	if (fs->e2fs_fmod != 0 && fs->e2fs_ronly != 0) {		/* XXX */
 		panic("ext2_sync: rofs mod fs=%s", fs->e2fs_fsmnt);
 	}
+
+	/* Process pending softdep worklist */
+	if (fs->e2fs_softdep != NULL)
+		ext2_worklist_process(fs->e2fs_softdep);
 
 	/*
 	 * Write back each (modified) inode.

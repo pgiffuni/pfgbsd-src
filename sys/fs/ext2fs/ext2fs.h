@@ -149,6 +149,8 @@ struct ext2fs {
  * In-Memory Superblock
  */
 
+struct ext2_softdep_mount;	/* forward decl; see ext2_softdep.h */
+
 struct m_ext2fs {
 	struct ext2fs * e2fs;
 	char     e2fs_fsmnt[MAXMNTLEN];/* name mounted on */
@@ -183,6 +185,7 @@ struct m_ext2fs {
 	int32_t  e2fs_uhash;	  /* 3 if hash should be signed, 0 if not */
 	uint32_t e2fs_csum_seed;  /* sb checksum seed */
 	uint64_t e2fs_maxsymlinklen; /* max size of short symlink */
+	struct	ext2_softdep_mount *e2fs_softdep; /* softdep state (or NULL) */
 };
 
 /* cluster summary information */

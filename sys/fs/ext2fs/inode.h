@@ -45,6 +45,9 @@
 
 #include <fs/ext2fs/ext2_extents.h>
 
+/* Forward declaration for softdep integration */
+struct ext2_inonedep;
+
 /*
  * This must agree with the definition in <ufs/ufs/dir.h>.
  */
@@ -118,6 +121,8 @@ struct inode {
 	};
 
 	struct ext4_extent_cache i_ext_cache; /* cache for ext4 extent */
+
+	struct ext2_inonedep *i_inonedep; /* softdep inode deps (or NULL) */
 
 	struct vn_clusterw i_clusterw;	/* Buffer clustering information */
 };

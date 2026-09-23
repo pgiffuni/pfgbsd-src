@@ -56,6 +56,7 @@
 #include <fs/ext2fs/fs.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_extattr.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 /*
  * Update the access, modified, and inode change times as specified by the
@@ -95,10 +96,19 @@ ext2_update(struct vnode *vp, int waitfor)
 		brelse(bp);
 		return (error);
 	}
+
+	/* Attach inode dependency for softdep write ordering */
+	if (fs->e2fs_softdep != NULL) {
+		if (ip->i_inonedep == NULL)
+			ext2_inonedep_attach(fs->e2fs_softdep, ip);
+		if (ip->i_inonedep != NULL)
+			EXT2_SET_BP_DEP(bp, &ip->i_inonedep->id_dep);
+	}
+
 	if (waitfor && !DOINGASYNC(vp))
-		return (bwrite(bp));
+		return (ext2_dep_bwrite(bp));
 	else {
-		bdwrite(bp);
+		ext2_dep_bdwrite(bp);
 		return (0);
 	}
 }
@@ -271,11 +281,11 @@ ext2_ind_truncate(struct vnode *vp, off_t length, int flags, struct ucred *cred,
 		if (bp->b_bufsize == fs->e2fs_bsize)
 			bp->b_flags |= B_CLUSTEROK;
 		if (flags & IO_SYNC)
-			bwrite(bp);
+			(void)ext2_dep_bwrite(bp);
 		else if (DOINGASYNC(ovp))
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		else
-			bawrite(bp);
+			(void)ext2_dep_bawrite(bp);
 		oip->i_flag |= IN_CHANGE | IN_UPDATE;
 		return (ext2_update(ovp, !DOINGASYNC(ovp)));
 	}
@@ -303,11 +313,11 @@ ext2_ind_truncate(struct vnode *vp, off_t length, int flags, struct ucred *cred,
 		if (bp->b_bufsize == fs->e2fs_bsize)
 			bp->b_flags |= B_CLUSTEROK;
 		if (flags & IO_SYNC)
-			bwrite(bp);
+			(void)ext2_dep_bwrite(bp);
 		else if (DOINGASYNC(ovp))
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		else
-			bawrite(bp);
+			(void)ext2_dep_bawrite(bp);
 	}
 	/*
 	 * Calculate index into inode's block list of
@@ -495,11 +505,11 @@ ext2_ext_truncate(struct vnode *vp, off_t length, int flags,
 		if (bp->b_bufsize == fs->e2fs_bsize)
 			bp->b_flags |= B_CLUSTEROK;
 		if (flags & IO_SYNC)
-			bwrite(bp);
+			(void)ext2_dep_bwrite(bp);
 		else if (DOINGASYNC(ovp))
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		else
-			bawrite(bp);
+			(void)ext2_dep_bawrite(bp);
 		oip->i_flag |= IN_CHANGE | IN_UPDATE;
 		return (ext2_update(ovp, !DOINGASYNC(ovp)));
 	}
@@ -526,11 +536,11 @@ ext2_ext_truncate(struct vnode *vp, off_t length, int flags,
 		if (bp->b_bufsize == fs->e2fs_bsize)
 			bp->b_flags |= B_CLUSTEROK;
 		if (flags & IO_SYNC)
-			bwrite(bp);
+			(void)ext2_dep_bwrite(bp);
 		else if (DOINGASYNC(ovp))
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		else
-			bawrite(bp);
+			(void)ext2_dep_bawrite(bp);
 	}
 
 	oip->i_size = osize;
@@ -640,6 +650,14 @@ ext2_reclaim(struct vop_reclaim_args *ap)
 		ip->i_flag |= IN_MODIFIED;
 		ext2_update(vp, 0);
 	}
+
+	/*
+	 * Clear the inonedep pointer.  The dep itself remains on the
+	 * mount's all_deps list and will be freed during unmount or
+	 * when its reference count drops to zero.
+	 */
+	ip->i_inonedep = NULL;
+
 	vfs_hash_remove(vp);
 	free(vp->v_data, M_EXT2NODE);
 	vp->v_data = 0;

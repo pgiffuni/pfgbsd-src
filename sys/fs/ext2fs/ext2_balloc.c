@@ -52,6 +52,7 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_mount.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 
@@ -87,6 +88,36 @@ ext2_ext_balloc(struct inode *ip, uint32_t lbn, int size,
 	if (flags & BA_CLRBUF)
 		vfs_bio_clrbuf(bp);
 
+	/*
+	 * For newly allocated extents, create a NEWBLK dependency so
+	 * the data block is written before any metadata references it.
+	 * Link it to the inode's INODEDEP for ordering.
+	 *
+	 * If softdep is enabled and dependency creation fails, the
+	 * allocation must be rolled back: silently proceeding without
+	 * the dependency would defeat the ordering guarantee.
+	 */
+	if (allocated && fs->e2fs_softdep != NULL) {
+		struct ext2_dep *newdep = ext2_newblk_dep_create(ip, bp);
+		struct ext2_dep *inode_dep;
+		if (newdep == NULL) {
+			/* Dep creation failed - roll back allocation */
+			ext2_rollback_unpublished(ip, newblk, 1);
+			brelse(bp);
+			return (ENOMEM);
+		}
+		inode_dep = ext2_inode_dep_get(ip);
+		if (inode_dep == NULL) {
+			EXT2_BP_DEP_CLEAR(bp);
+			ext2_dep_cancel(newdep);
+			ext2_dep_rele(newdep);
+			ext2_rollback_unpublished(ip, newblk, 1);
+			brelse(bp);
+			return (ENOMEM);
+		}
+		ext2_dep_add_dependency(newdep, inode_dep);
+	}
+
 	*bpp = bp;
 
 	return (error);
@@ -107,6 +138,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 	struct vnode *vp = ITOV(ip);
 	struct indir indirs[EXT2_NIADDR + 2];
 	struct ext2_alloc_context ctx;
+	struct ext2_dep *dep;
 	e2fs_daddr_t *bap;
 	e4fs_daddr_t bpref, pref, newb;
 	int num, i, error;
@@ -173,9 +205,40 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 			bp->b_blkno = fsbtodb(fs, newb);
 			if (flags & BA_CLRBUF)
 				vfs_bio_clrbuf(bp);
+
+			/*
+			 * Create NEWBLK dep: new block must be written before
+			 * inode metadata referencing it can be written.
+			 *
+			 * If dep creation fails and softdep is enabled, the
+			 * allocation must be rolled back.
+			 */
+			if (fs->e2fs_softdep != NULL) {
+				struct ext2_dep *newdep =
+				    ext2_newblk_dep_create(ip, bp);
+				struct ext2_dep *inode_dep;
+				if (newdep == NULL) {
+					EXT2_UNLOCK(ump);
+					ext2_rollback_unpublished(ip, newb, 1);
+					brelse(bp);
+					return (ENOMEM);
+				}
+				inode_dep = ext2_inode_dep_get(ip);
+				if (inode_dep == NULL) {
+					EXT2_BP_DEP_CLEAR(bp);
+					ext2_dep_cancel(newdep);
+					ext2_dep_rele(newdep);
+					EXT2_UNLOCK(ump);
+					ext2_rollback_unpublished(ip, newb, 1);
+					brelse(bp);
+					return (ENOMEM);
+				}
+				ext2_dep_add_dependency(newdep, inode_dep);
+			}
 		}
 		ip->i_db[lbn] = dbtofsb(fs, bp->b_blkno);
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
+
 		*bpp = bp;
 		return (0);
 	}
@@ -215,10 +278,40 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		bp->b_blkno = fsbtodb(fs, pref);
 		vfs_bio_clrbuf(bp);
 		/*
-		 * Write synchronously so that indirect blocks
-		 * never point at garbage.
+		 * Create NEWBLK dep: new indirect block must be written
+		 * before inode metadata referencing it can be written.
+		 * Link it to the inode's INODEDEP for ordering.
+		 *
+		 * If dep creation fails, roll back the allocation.
 		 */
-		if ((error = bwrite(bp)) != 0) {
+		if (fs->e2fs_softdep != NULL) {
+			struct ext2_dep *newdep =
+			    ext2_newblk_dep_create(ip, bp);
+			struct ext2_dep *inode_dep;
+			if (newdep == NULL) {
+				EXT2_UNLOCK(ump);
+				ext2_rollback_unpublished(ip, pref, 1);
+				brelse(bp);
+				return (ENOMEM);
+			}
+			inode_dep = ext2_inode_dep_get(ip);
+			if (inode_dep == NULL) {
+				EXT2_BP_DEP_CLEAR(bp);
+				ext2_dep_cancel(newdep);
+				ext2_dep_rele(newdep);
+				EXT2_UNLOCK(ump);
+				ext2_rollback_unpublished(ip, pref, 1);
+				brelse(bp);
+				return (ENOMEM);
+			}
+			ext2_dep_add_dependency(newdep, inode_dep);
+		}
+		/*
+		 * Write synchronously so that indirect blocks
+		 * never point at garbage.  Use ext2_dep_bwrite
+		 * to honor any softdep dependency attached to bp.
+		 */
+		if ((error = ext2_dep_bwrite(bp)) != 0) {
 			/*
 			 * bwrite failed after allocating the indirect block.
 			 * The block is unpublished: pref was set but not yet
@@ -272,16 +365,50 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		nbp->b_blkno = fsbtodb(fs, pref);
 		vfs_bio_clrbuf(nbp);
 		/*
-		 * Write synchronously so that indirect blocks
-		 * never point at garbage.
+		 * Create NEWBLK dep for the new child indirect block.
+		 * Link it to a METAD_PUB dep on the parent indirect
+		 * buffer (bp), which in turn depends on the INODEDEP.
+		 *
+		 * If dep creation fails, roll back the child block
+		 * allocation.
 		 */
-		if ((error = bwrite(nbp)) != 0) {
+		if (fs->e2fs_softdep != NULL) {
+			struct ext2_dep *newdep =
+			    ext2_newblk_dep_create(ip, nbp);
+			struct ext2_dep *metadep;
+			if (newdep == NULL) {
+				EXT2_UNLOCK(ump);
+				ext2_rollback_unpublished(ip, pref, 1);
+				brelse(nbp);
+				brelse(bp);
+				return (ENOMEM);
+			}
+			metadep = ext2_metadep_get_or_create(ip, bp);
+			if (metadep == NULL) {
+				EXT2_BP_DEP_CLEAR(nbp);
+				ext2_dep_cancel(newdep);
+				ext2_dep_rele(newdep);
+				EXT2_UNLOCK(ump);
+				ext2_rollback_unpublished(ip, pref, 1);
+				brelse(nbp);
+				brelse(bp);
+				return (ENOMEM);
+			}
+			ext2_dep_add_dependency(newdep, metadep);
+		}
+		/*
+		 * Write synchronously so that indirect blocks
+		 * never point at garbage.  Use ext2_dep_bwrite
+		 * to honor any softdep dependency attached to nbp.
+		 */
+		if ((error = ext2_dep_bwrite(nbp)) != 0) {
 			/*
-			 * bwrite failed after allocating the indirect block.
-			 * The block is unpublished (pref not yet stored in
-			 * bap[]).  bwrite already released nbp; bp is still
-			 * held as the parent indirect block and must be
-			 * released.
+			 * bwrite failed after allocating the
+			 * indirect block.  The block is unpublished
+			 * (pref not yet stored in bap[]).  bwrite
+			 * already released nbp; bp is still held
+			 * as the parent indirect block and must
+			 * be released.
 			 */
 			ext2_rollback_unpublished(ip, pref, 1);
 			brelse(bp);
@@ -295,20 +422,23 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * at the top of the next iteration.
 		 */
 		if (flags & IO_SYNC) {
-			if ((error = bwrite(bp)) != 0) {
+			if ((error = ext2_dep_bwrite(bp)) != 0) {
 				/*
-				 * bwrite of the parent indirect block
-				 * failed after the child indirect block
-				 * (pref) was allocated, i_blocks was
-				 * incremented, and the child was written.
-				 * The child is now orphaned: it exists on
-				 * disk but is not reachable from the
-				 * inode.  Roll it back.
+				 * bwrite of the parent indirect
+				 * block failed after the child
+				 * indirect block (pref) was
+				 * allocated, i_blocks was
+				 * incremented, and the child
+				 * was written.  The child is
+				 * now orphaned: it exists on
+				 * disk but is not reachable
+				 * from the inode.  Roll it
+				 * back.
 				 */
 				ext2_rollback_unpublished(ip, pref, 1);
-				bp = NULL;
 				return (error);
 			}
+			bp = NULL;
 		} else {
 			if (bp->b_bufsize == fs->e2fs_bsize)
 				bp->b_flags |= B_CLUSTEROK;
@@ -367,13 +497,54 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		if (flags & BA_CLRBUF)
 			vfs_bio_clrbuf(nbp);
 		bap[indirs[i].in_off] = htole32(pref);
+		/*
+		 * Create NEWBLK dep for the new data block.
+		 * Link it to a METAD_PUB dep on the parent indirect
+		 * buffer (bp), which in turn depends on INODEDEP.
+		 *
+		 * If dep creation fails, roll back the allocation
+		 * via ctx (transition is still MAPPED, not PUBLISHED).
+		 */
+		if (fs->e2fs_softdep != NULL) {
+			struct ext2_dep *newdep =
+			    ext2_newblk_dep_create(ip, nbp);
+			struct ext2_dep *metadep;
+			if (newdep == NULL) {
+				EXT2_UNLOCK(ump);
+				ext2_rollback_allocation(&ctx);
+				brelse(nbp);
+				brelse(bp);
+				return (ENOMEM);
+			}
+			metadep = ext2_metadep_get_or_create(ip, bp);
+			if (metadep == NULL) {
+				EXT2_BP_DEP_CLEAR(nbp);
+				ext2_dep_cancel(newdep);
+				ext2_dep_rele(newdep);
+				EXT2_UNLOCK(ump);
+				ext2_rollback_allocation(&ctx);
+				brelse(nbp);
+				brelse(bp);
+				return (ENOMEM);
+			}
+			ext2_dep_add_dependency(newdep, metadep);
+		}
 		ext2_alloc_transition(&ctx, EXT2_ALLOC_MAPPED);
+		/*
+		 * Invariant: the PUBLISHED transition (ext2_alloc_transition
+		 * below) only occurs after ext2_dep_bwrite succeeds, because
+		 * bwrite() honors softdep ordering.  If softdep is enabled
+		 * and dep creation failed above with rollback, we never
+		 * reach this point.  Thus PUBLISHED implies the softdep
+		 * dependency is fully attached and the block is safe to
+		 * reference from metadata.
+		 */
 		/*
 		 * If required, write synchronously, otherwise use
 		 * delayed write.
 		 */
 		if (flags & IO_SYNC) {
-			if ((error = bwrite(bp)) != 0) {
+			if ((error = ext2_dep_bwrite(bp)) != 0) {
 				/*
 				 * bwrite failed for the parent indirect
 				 * block after the data block was
@@ -390,6 +561,25 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 				 */
 				EXT2_UNLOCK(ump);
 				ext2_rollback_allocation(&ctx);
+				/*
+				 * nbp may have a NEWBLK dep attached by
+				 * ext2_newblk_dep_create.  Detach it so
+				 * the dep is freed and the buffer's
+				 * b_fsprivate1 doesn't hold a stale
+				 * reference after brelse.
+				 */
+				dep = EXT2_BP_DEP(nbp);
+				if (dep != NULL) {
+					EXT2_BP_DEP_CLEAR(nbp);
+					dep->dep_bp = NULL;
+					/*
+					 * Remove dependency graph edges
+					 * before releasing, so successors
+					 * don't hold stale references.
+					 */
+					ext2_dep_cancel(dep);
+					ext2_dep_rele(dep);
+				}
 				brelse(nbp);
 				return (error);
 			}
@@ -397,7 +587,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		} else {
 			if (bp->b_bufsize == fs->e2fs_bsize)
 				bp->b_flags |= B_CLUSTEROK;
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		}
 		*bpp = nbp;
 		EXT2_UNLOCK(ump);

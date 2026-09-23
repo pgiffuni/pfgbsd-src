@@ -89,6 +89,7 @@
 #include <fs/ext2fs/ext2_mount.h>
 #include <fs/ext2fs/ext2_extattr.h>
 #include <fs/ext2fs/ext2_extents.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -2290,26 +2291,26 @@ ext2_write(struct vop_write_args *ap)
 		 * or a delayed write (if not).
 		 */
 		if (ioflag & IO_SYNC) {
-			(void)bwrite(bp);
+			(void)ext2_dep_bwrite(bp);
 		} else if (vm_page_count_severe() ||
 			    buf_dirty_count_severe() ||
 		    (ioflag & IO_ASYNC)) {
 			bp->b_flags |= B_CLUSTEROK;
-			bawrite(bp);
+			(void)ext2_dep_bawrite(bp);
 		} else if (xfersize + blkoffset == fs->e2fs_fsize) {
 			if ((vp->v_mount->mnt_flag & MNT_NOCLUSTERW) == 0) {
 				bp->b_flags |= B_CLUSTEROK;
 				cluster_write(vp, &ip->i_clusterw, bp,
 				    ip->i_size, seqcount, 0);
 			} else {
-				bawrite(bp);
+				(void)ext2_dep_bawrite(bp);
 			}
 		} else if (ioflag & IO_DIRECT) {
 			bp->b_flags |= B_CLUSTEROK;
-			bawrite(bp);
+			(void)ext2_dep_bawrite(bp);
 		} else {
 			bp->b_flags |= B_CLUSTEROK;
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		}
 		if (error || xfersize == 0)
 			break;
