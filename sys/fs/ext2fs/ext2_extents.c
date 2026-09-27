@@ -830,20 +830,10 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 		error = bwrite(bp);
 		if (error) {
 			/*
-			 * bwrite() failed: the buffer was released by
-			 * bwrite() internally, but it remains dirty in
-			 * the buffer cache.  The in-memory extent-tree
-			 * data (copied via ext4_ext_fill_path_buf above)
-			 * is now stale — it may reference physical blocks
-			 * that the caller (rollback path) will free.
-			 *
-			 * Re-acquire the buffer and discard the dirty data
-			 * so that a subsequent read re-fetches the on-disk
-			 * copy instead of observing the modified in-memory
-			 * extent tree.  If the buffer has been evicted in
-			 * the interim, getblk returns a fresh buffer and
-			 * the stale one is simply not found — acceptable
-			 * on this error-recovery path.
+			 * bwrite() left the modified extent tree dirty in
+			 * the cache.  Discard it, so a later read sees the
+			 * on-disk tree instead of one naming blocks the
+			 * caller's rollback is about to free.
 			 */
 			bp = getblk(ip->i_devvp, fsbtodb(fs, blk),
 			    fs->e2fs_bsize, 0, 0, 0);
@@ -1095,11 +1085,7 @@ cleanup:
 		brelse(bp);
 
 	if (error) {
-		/*
-		 * Roll back each metadata allocation that succeeded.
-		 * Each block was committed by ext4_ext_alloc_meta()
-		 * (i_blocks incremented), so use scalar rollback.
-		 */
+		/* Undo the metadata blocks allocated by this split. */
 		for (i = 0; i < depth; i++) {
 			if (!ablks[i])
 				continue;
@@ -1270,18 +1256,12 @@ ext4_ext_correct_indexes(struct inode *ip, struct ext4_extent_path *path)
 }
 
 /*
- * ext4_ext_insert_extent — insert a new extent into the extent tree.
+ * ext4_ext_insert_extent -- insert a new extent into the extent tree.
  *
- * If ctx is non-NULL, the context's state is advanced to MAPPED
- * and then PUBLISHED upon successful write of the modified extent
- * tree block to disk.  A partial failure (e.g., ext4_ext_dirty
- * returning an error after in-memory modifications) leaves the
- * context in MAPPED state — unpublished — so the caller's rollback
- * path will correctly reverse the allocation.
- *
- * If ctx is NULL (e.g., truncate or split paths that don't go
- * through the allocation context), the function operates in legacy
- * mode without state tracking.
+ * When ctx is given it is advanced to MAPPED and PUBLISHED once the
+ * modified tree has been written; on failure it stays MAPPED, which
+ * leaves the caller's rollback allowed.  Callers without an allocation
+ * (truncate, split) pass NULL.
  */
 static int
 ext4_ext_insert_extent(struct inode *ip, struct ext4_extent_path *path,
@@ -1408,16 +1388,8 @@ merge:
 		goto cleanup;
 
 	/*
-	 * The extent record has been successfully written to disk.
-	 * If the caller provided an allocation context, advance it
-	 * through the MAPPED and PUBLISHED transitions to reflect
-	 * that the block pointer is now reachable from on-disk inode
-	 * metadata.
-	 *
-	 * ext4_ext_dirty() calls bwrite() internally — if bwrite()
-	 * succeeded (error == 0), the metadata is durable.  The
-	 * PUBLISHED transition is only applied on success; a failure
-	 * leaves the context in MAPPED state, eligible for rollback.
+	 * ext4_ext_dirty() wrote the tree out, so the extent now names
+	 * the run on disk and the allocation is published.
 	 */
 	if (ctx) {
 		ext2_alloc_transition(ctx, EXT2_ALLOC_MAPPED);
@@ -1439,6 +1411,7 @@ ext4_new_blocks(struct inode *ip, daddr_t lbn, e4fs_daddr_t pref,
     struct ucred *cred, unsigned long *count, int *perror,
     struct ext2_alloc_context *ctx)
 {
+	enum ext2_alloc_class alloc_class;
 	int error;
 
 	if (ctx == NULL) {
@@ -1450,57 +1423,37 @@ ext4_new_blocks(struct inode *ip, daddr_t lbn, e4fs_daddr_t pref,
 		return (0);
 
 	/*
-	 * ext2_alloc_run() returns exactly one contiguous run.
-	 * Cap the requested count to a sane maximum so we never
-	 * request more blocks than an extent can record.
+	 * ext2_alloc_run() returns exactly one contiguous run, so the
+	 * caller's count may come back longer than it asked for.  Never
+	 * ask for more than one extent record can express.
 	 */
 	if (*count > EXT4_MAX_LEN)
 		*count = EXT4_MAX_LEN;
 
 	EXT2_LOCK(ip->i_ump);
-	/*
-	 * ext2_alloc_run() enforces the reserved-block policy
-	 * and free-blocks check internally; no caller-side checks needed.
-	 */
-	{
-		enum ext2_alloc_class alloc_class;
-
-		if (lbn == (daddr_t)ip->i_next_alloc_block + 1)
-			alloc_class = EXT2_ALLOC_DATA_SEQ;
-		else
-			alloc_class = EXT2_ALLOC_DATA_RAND;
-		error = ext2_alloc_run(ip, lbn, (uint32_t)*count, pref,
-		    alloc_class, cred, ctx);
-	}
-	/*
-	 * Lock contract: ext2_alloc_run returns with EXT2_LOCK held.
-	 * On failure, goto nospace (which unlocks).
-	 */
+	if (lbn == (daddr_t)ip->i_next_alloc_block + 1)
+		alloc_class = EXT2_ALLOC_DATA_SEQ;
+	else
+		alloc_class = EXT2_ALLOC_DATA_RAND;
+	/* Returns with EXT2_LOCK held, also on failure. */
+	error = ext2_alloc_run(ip, lbn, (uint32_t)*count, pref,
+	    alloc_class, cred, ctx);
 	if (error)
 		goto nospace;
 
-	/*
-	 * ext2_alloc_run succeeded; lock is still held.
-	 * Commit inode accounting (i_blocks, hints, flags) while
-	 * the lock is held — ext2_commit_allocated_block modifies
-	 * i_blocks, i_next_alloc_block/goal, and i_flag.
-	 */
 	*count = ctx->run.par_length;
 	ext2_commit_allocated_block(ip, ctx);
 	*perror = 0;
 	EXT2_UNLOCK(ip->i_ump);
 
 	/*
-	 * ext2_update() performs a synchronous write via bwrite(), which
-	 * can sleep (g_vfs_strategy -> uma_zalloc).  It must NOT be called
-	 * with EXT2_LOCK held — release the lock first.  All in-memory
-	 * inode state was already updated under the lock by
-	 * ext2_commit_allocated_block() above.
+	 * ext2_update() writes the inode out and may sleep, so it must
+	 * not run under EXT2_LOCK; the in-memory state it writes was
+	 * already updated above.
 	 */
 	ext2_update(ip->i_vnode, 1);
 	return (ctx->run.par_physical_start);
 nospace:
-	mtx_assert(EXT2_MTX(ip->i_ump), MA_OWNED);
 	EXT2_UNLOCK(ip->i_ump);
 	*perror = ENOSPC;
 	return (0);
@@ -1588,22 +1541,8 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 	error = ext4_ext_insert_extent(ip, path, &newex, &ctx);
 	if (error) {
 		/*
-		 * Extent insertion failed after physical blocks were
-		 * allocated and i_blocks was updated by ext4_new_blocks()
-		 * via ext2_commit_allocated_block().
-		 *
-		 * Invariant: the blocks are unpublished.  ext4_new_blocks()
-		 * populated 'ctx' with the allocated run and committed
-		 * i_blocks accounting, but ext4_ext_insert_extent() failed
-		 * before installing the extent record into the on-disk
-		 * extent tree.  No pointer from inode metadata references
-		 * these blocks.
-		 *
-		 * Therefore this is an allocation rollback, not a
-		 * consistency repair.  The context has accounting_applied=
-		 * true (set by ext2_commit_allocated_block) and state=
-		 * ALLOCATED (set by ext2_alloc_run).  ROLLBACK is
-		 * permitted from ALLOCATED state.
+		 * No extent record reached the disk, so the run is
+		 * unpublished and can simply be given back.
 		 */
 #ifdef INVARIANTS
 		if (allocated == 0)
@@ -1617,23 +1556,12 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 		goto out2;
 	}
 
-	/*
-	 * MAPPED/PUBLISHED transitions were recorded inside
-	 * ext4_ext_insert_extent() via the propagated context on
-	 * the success path of ext4_ext_dirty().
-	 */
 	newblk = ext4_ext_extent_pblock(&newex);
 	ext4_ext_put_in_cache(ip, iblk, allocated, newblk, EXT4_EXT_CACHE_IN);
 	*pallocated = 1;
 
 out:
-	/*
-	 * On success path: 'path' still holds no buffer references (all
-	 * were released inside ext4_ext_find_extent).  The data buffer
-	 * bp is freshly bread()'d below for the caller; ownership is
-	 * transferred to *bpp on success, or released via brelse() on
-	 * error.
-	 */
+	/* The run may be longer than the caller asked for. */
 	if (allocated > max_blocks)
 		allocated = max_blocks;
 
@@ -1649,14 +1577,7 @@ out:
 	}
 
 out2:
-	/*
-	 * Path ownership: 'path' holds malloc'd ep_data copies but NO
-	 * buffer references (all bread/bqrelse pairs are balanced inside
-	 * ext4_ext_find_extent).  If ext4_ext_insert_extent() called
-	 * ext4_ext_dirty(), the buffer was acquired via getblk/internal
-	 * bread, written via bwrite (which releases), and is no longer
-	 * held.  Freeing the path here is therefore buffer-safe.
-	 */
+	/* The path holds no buffer references at this point. */
 	if (path) {
 		ext4_ext_drop_refs(path);
 		free(path, M_EXT2EXTENTS);

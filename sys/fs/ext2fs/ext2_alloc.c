@@ -82,10 +82,9 @@ static uint32_t	ext2_run_desired_length(struct inode *, uint32_t,
     enum ext2_alloc_class);
 
 /*
- * Maximum physical allocation run length (tunable via sysctl).
- * Bounds the target length returned by ext2_run_desired_length()
- * so the physical allocator never requests an unreasonably long
- * contiguous run.  This is a cap, not a preallocation amount.
+ * Upper bound on the length of a physical allocation run, tunable via
+ * sysctl.  It caps the target computed by ext2_run_desired_length();
+ * it is not a preallocation amount.
  */
 static int	ext2_alloc_max_run = EXT2_MAXCONTIG;
 
@@ -132,36 +131,15 @@ ext2_alloc(struct inode *ip, daddr_t lbn, e4fs_daddr_t bpref, int size,
 	if (size == fs->e2fs_bsize && fs->e2fs_fbcount == 0)
 		goto nospace;
 
-	/*
-	 * ext2_alloc_run() now owns context initialization and the
-	 * reserved-block policy check.  Callers must not pre-initialize
-	 * the context.
-	 */
+	/* ext2_alloc_run() owns the context and the reserved-block check. */
 	error = ext2_alloc_run(ip, lbn, 1, bpref, EXT2_ALLOC_DATA_RAND,
 	    cred, &ctx);
-	/*
-	 * Lock contract: ext2_alloc_run() returns with EXT2_LOCK held
-	 * on both success and failure.  Caller is responsible for
-	 * unlocking.
-	 */
 	if (error) {
-		/*
-		 * Preserve the original error from ext2_alloc_run()
-		 * (e.g. EINVAL, EDEADLK, ENOSPC) rather than collapsing
-		 * every failure path to ENOSPC.  The nospace label below
-		 * handles only the pre-check fbcount/rbcount failures.
-		 */
-		mtx_assert(EXT2_MTX(ump), MA_OWNED);
 		EXT2_UNLOCK(ump);
 		return (error);
 	}
 
-	/*
-	 * Commit inode accounting (i_blocks, hints, flags) while the
-	 * lock is still held from ext2_alloc_run().  The block is
-	 * unpublished at this point — callers in ext2_balloc.c install
-	 * it into i_db[]/i_ib[] and publish via bwrite() separately.
-	 */
+	/* Lock is still held; the block stays unpublished until mapped. */
 	ext2_commit_allocated_block(ip, &ctx);
 	*bnp = ctx.run.par_physical_start;
 	EXT2_UNLOCK(ump);
@@ -195,184 +173,76 @@ ext2_alloc_meta(struct inode *ip)
 	return (blk);
 }
 /*
- * Calculate the desired physical run length from the request and
- * filesystem policy information.
+ * Compute the target length of a physical allocation run.
  *
- * This function returns the target run length that ext2_alloc_run()
- * should attempt to allocate.  It does NOT add e2fs_prealloc on top
- * of the request — the physical allocator allocates only the blocks
- * the caller can consume.  e2fs_prealloc is used solely as a cap
- * (via ext2_alloc_max_run), never as an inflation factor.
- *
- * The function distinguishes two quantities:
- *   - logical_length: minimum blocks required (also the target when
- *     no preallocation policy applies).
- *   - maximum_requestable_length: the largest run that satisfies all
- *     hard caps (cluster summary capacity, group size, free block
- *     count, sysctl maximum).  This is an upper bound, NOT a guarantee
- *     that a contiguous run of this length exists — the actual
- *     feasibility decision is made by ext2_clusteralloc() or other
- *     run-search routines at allocation time.
- *
- * If maximum_requestable_length < logical_length, returns 0 to signal
- * failure.
+ * Returns 0 if the request cannot be served at all.  A request for
+ * logical_length > 1 blocks is only satisfied by a run of at least that
+ * length; requests for a single block fall back to a single block when
+ * no run of the target length is available.
  */
 static uint32_t
 ext2_run_desired_length(struct inode *ip, uint32_t logical_length,
     enum ext2_alloc_class alloc_class)
 {
 	struct m_ext2fs *fs;
-	uint32_t maximum_requestable_length;
+	uint32_t maxlen, target;
 
 	fs = ip->i_e2fs;
 
-	/*
-	 * Compute the maximum requestable physical run length from all
-	 * hard caps.  This is the largest run we may request; whether
-	 * a contiguous run of this length actually exists in any
-	 * cylinder group is a feasibility question for the run-search
-	 * routine, not for this cap computation.
-	 */
-	maximum_requestable_length = (uint32_t)fs->e2fs_fbcount;
-	if (fs->e2fs_contigsumsize > 0 &&
-	    (uint32_t)fs->e2fs_contigsumsize < maximum_requestable_length)
-		maximum_requestable_length = fs->e2fs_contigsumsize;
-	if ((uint32_t)fs->e2fs_bpg < maximum_requestable_length)
-		maximum_requestable_length = fs->e2fs_bpg;
-	if ((uint32_t)ext2_alloc_max_run < maximum_requestable_length)
-		maximum_requestable_length = ext2_alloc_max_run;
-
-	/*
-	 * If the minimum requested length exceeds all hard caps,
-	 * signal failure.  Do NOT coerce maximum_requestable_length
-	 * to 1 when it is zero — that would convert an impossible
-	 * request into an apparently valid one.  A zero
-	 * maximum_requestable_length means no cap could be derived
-	 * from filesystem geometry or free-space summary, and the
-	 * caller should treat the request as unserviceable.
-	 */
-	if (maximum_requestable_length < logical_length)
+	/* Hard caps: free blocks, cluster summaries, group size, sysctl. */
+	maxlen = (uint32_t)fs->e2fs_fbcount;
+	if (fs->e2fs_contigsumsize > 0 && (uint32_t)fs->e2fs_contigsumsize < maxlen)
+		maxlen = fs->e2fs_contigsumsize;
+	if ((uint32_t)fs->e2fs_bpg < maxlen)
+		maxlen = fs->e2fs_bpg;
+	if ((uint32_t)ext2_alloc_max_run < maxlen)
+		maxlen = ext2_alloc_max_run;
+	if (maxlen < logical_length)
 		return (0);
 
+	target = logical_length;
 	switch (alloc_class) {
 	case EXT2_ALLOC_DATA_SEQ:
 		/*
-		 * For sequential data writes, the physical allocator may
-		 * return a run longer than logical_length (up to
-		 * maximum_requestable_length).  ext2_alloc_run() will
-		 * try clusteralloc for the target length first, and fall
-		 * back to a single-block allocation if the contiguous
-		 * run is not available.  This lets the extent mapping
-		 * layer create larger, more efficient extent records.
-		 *
-		 * Preallocation policy:
-		 *   - e2fs_prealloc is NOT used as an inflation factor
-		 *     (per design: the physical allocator allocates only
-		 *     blocks the caller can consume).  Instead, the
-		 *     target is bounded by free-space summary capacity
-		 *     (e2fs_contigsumsize) and the sysctl knob
-		 *     ext2_alloc_max_run.
-		 *   - logical_length remains the minimum guaranteed.
-		 *     For the extent path, logical_length is always 1
-		 *     (one block per ext2_write write-loop iteration);
-		 *     the preallocation is the extra blocks the run may
-		 *     return beyond the minimum.
+		 * Ask for the filesystem's preallocation target on top of a
+		 * small request, so that a sequential stream of small writes
+		 * gets a run long enough to cluster.  s_prealloc_blocks is
+		 * 8 by default; ext2_alloc_max_run is the ceiling.
 		 */
-		return (maximum_requestable_length);
-
+		if (target < (uint32_t)fs->e2fs_prealloc)
+			target = fs->e2fs_prealloc;
+		break;
 	case EXT2_ALLOC_DATA_RAND:
 	case EXT2_ALLOC_DIRECTORY:
-		/*
-		 * Physical allocator does not inflate the request with
-		 * e2fs_prealloc.  Return exactly logical_length; the
-		 * mapping layer owns preallocation policy.
-		 */
-		return (logical_length);
-
+		/* No speculative space for non-sequential data or directories. */
+		break;
 	case EXT2_ALLOC_INDIR_METADATA:
 	case EXT2_ALLOC_EXTENT_METADATA:
-		/*
-		 * Metadata: remain conservative, one block at a time.
-		 */
-		if (logical_length > 1)
+		/* Metadata stays one block at a time. */
+		if (target > 1)
 			return (0);
-		return (1);
-
-	default:
-		return (logical_length);
+		break;
 	}
+
+	if (target > maxlen)
+		target = maxlen;
+	return (target);
 }
 
 /*
- * Physical run allocator.
+ * Allocate one physically contiguous run of blocks.
  *
- * Allocates one physically contiguous run of blocks for the given inode.
- * The physical allocator only updates block bitmaps and free-space
- * accounting — NEVER inode accounting (i_blocks, i_next_alloc_block,
- * i_next_alloc_goal, i_flag).  The mapping layer caller owns all
- * inode state updates.
+ * The physical allocator only touches block bitmaps and free space
+ * accounting; inode accounting is the caller's business, via
+ * ext2_commit_allocated_block().  Group selection is lexicographic:
+ * continue the previous run, stay in the same group, take the whole
+ * run, and only then rehash into other groups.
  *
- * Allocation policy (lexicographic):
- *   1. continue the previous physical run when practical;
- *   2. prefer the same block group;
- *   3. prefer the requested run length;
- *   4. avoid destroying large free runs unnecessarily;
- *   5. fall back to other groups when necessary.
- *
- * Minimum satisfaction rule:
- *   If logical_length == 1, any single allocated block is acceptable.
- *   If logical_length > 1, the allocator returns a run with length >=
- *   logical_length or returns ENOSPC.  Partial runs shorter than
- *   logical_length are never returned for logical_length > 1.
- *
- * Callback contract — ext2_clusteralloc() and ext2_alloccg():
- *   Both callbacks are invoked by ext2_hashalloc() with EXT2_LOCK held.
- *   On success, each returns the physical block number and allocates
- *   EXACTLY the requested number of blocks (len for clusteralloc, 1 for
- *   alloccg).  On failure, each returns 0 and allocates nothing.
- *   Callbacks release EXT2_LOCK on success; they leave it held on
- *   failure so ext2_hashalloc() can try the next group.
- *
- *   ext2_clusteralloc() is guaranteed to allocate precisely `len`
- *   contiguous blocks — the bitmap search loop requires run == len
- *   before proceeding, and the allocation loop sets exactly `len`
- *   bits.  ext2_alloccg() allocates exactly one block.
- *
- * Lock ownership:
- *   Called with EXT2_LOCK held (mtx_asserted at entry).
- *   Returns with EXT2_LOCK held on every path (success and failure).
- *   Caller must release the lock.
- *
- * Parameters:
- *   ip              inode to allocate for
- *   logical_start   logical block number (continuation hint)
- *   logical_length  minimum blocks required (and target when no
- *                   preallocation policy is active)
- *   bpref           preferred physical block (0 for none)
- *   alloc_class     allocation class
- *   cred            credential for reserved-block policy check
- *                  (NOCRED is treated as privileged — see notes below)
- *   ctxp            output: allocation context with physical run and
- *                   lifecycle state
- *
- * Returns:
- *   0 and ctxp->run populated, ctxp->state == EXT2_ALLOC_ALLOCATED
- *   on success; errno on failure (ctxp zeroed, state unchanged).
- *
- * Reserved-block policy:
- *   The check is centralized here rather than at each call site.
- *   Non-privileged callers (cr_uid != 0) are denied when free blocks
- *   fall below the reserved margin (e2fs_fbcount < e2fs_rbcount).
- *   Root (cr_uid == 0) may consume the reserved margin.
- *
- *   NOCRED handling:
- *   Callers should always provide a real credential.  Under
- *   INVARIANTS, NOCRED triggers a panic (coding error).  In
- *   production, NOCRED is treated as privileged (root) to avoid
- *   blocking legitimate kernel-internal allocation paths that may
- *   not have a credential.  This matches the convention used by
- *   ext2_alloc_meta() which operates under the mount lock and
- *   assumes kernel authority.
+ * Must be called with EXT2_LOCK held, and returns with it held on both
+ * success and failure.  On success ctxp->state is EXT2_ALLOC_ALLOCATED
+ * and a run of at least logical_length blocks was reserved.  A request
+ * of one block is satisfied by a single block if no longer run is
+ * available; a longer request fails rather than return a short run.
  */
 int
 ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
@@ -385,7 +255,6 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 	e4fs_daddr_t bno;
 	uint32_t desired_len;
 	int cg;
-	int error;
 
 	fs = ip->i_e2fs;
 	ump = ip->i_ump;
@@ -400,16 +269,10 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 		panic("ext2_alloc_run: missing credential");
 #endif		/* INVARIANTS */
 
-	/*
-	 * Centralized reserved-block policy (see docstring above):
-	 * non-privileged callers cannot consume the reserved margin.
-	 * NOCRED is treated as privileged.
-	 */
+	/* Unprivileged callers may not eat into the reserved blocks. */
 	if (cred != NOCRED && cred->cr_uid != 0 &&
-	    fs->e2fs_fbcount < fs->e2fs_rbcount) {
-		error = ENOSPC;
-		goto out;
-	}
+	    fs->e2fs_fbcount < fs->e2fs_rbcount)
+		return (ENOSPC);
 
 	bzero(ctxp, sizeof(*ctxp));
 	ctxp->ip = ip;
@@ -417,32 +280,20 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 	ctxp->logical_length = logical_length;
 	ctxp->state = EXT2_ALLOC_ALLOCATED;
 
-	if (logical_length == 0) {
-		error = EINVAL;
-		goto out;
-	}
-	if (fs->e2fs_fbcount == 0) {
-		error = ENOSPC;
-		goto out;
-	}
+	if (logical_length == 0)
+		return (EINVAL);
+	if (fs->e2fs_fbcount == 0)
+		return (ENOSPC);
 
 	desired_len = ext2_run_desired_length(ip, logical_length, alloc_class);
-	if (desired_len == 0) {
-		error = ENOSPC;
-		goto out;
-	}
+	if (desired_len == 0)
+		return (ENOSPC);
 
 	/*
-	 * Determine preferred cylinder group:
-	 *   1. supplied physical preference
-	 *   2. continuation of previous allocation (i_next_alloc_goal)
-	 *   3. inode's block group
-	 *
-	 * Hint validation: i_next_alloc_goal is a hint, not ownership.
-	 * The lower-level allocator (ext2_alloccg/ext2_clusteralloc)
-	 * validates that the preference is in the correct cylinder group
-	 * and will treat an out-of-group hint as bpref=0.  Hints are
-	 * cleared on rollback by ext2_rollback_allocation().
+	 * Preferred group: the supplied block if there is one, otherwise
+	 * the continuation hint recorded by the previous allocation, and
+	 * the inode's own group.  A hint that does not belong to the
+	 * chosen group is ignored by the group allocators.
 	 */
 	if (bpref >= fs->e2fs_bcount)
 		bpref = 0;
@@ -455,125 +306,39 @@ ext2_alloc_run(struct inode *ip, e2fs_lbn_t logical_start,
 		cg = dtog(fs, bpref);
 	}
 
-	/*
-	 * Step 1: for multi-block requests, try contiguous cluster
-	 * allocation.  ext2_hashalloc() tries the preferred group
-	 * first, then quadratically rehashes into other groups,
-	 * calling ext2_clusteralloc() at each group.
-	 *
-	 * Callback contract: on success, ext2_clusteralloc allocates
-	 * exactly desired_len contiguous blocks and returns the
-	 * physical start.  On failure, it allocates nothing and
-	 * returns 0 with the lock held.
-	 */
+	/* Contiguous run first; ext2_hashalloc() rehases on failure. */
 	if (desired_len > 1 && fs->e2fs_contigsumsize > 0) {
-#ifdef INVARIANTS
-		mtx_assert(EXT2_MTX(ump), MA_OWNED);
-#endif
 		bno = ext2_hashalloc(ip, cg, bpref, desired_len,
 		    ext2_clusteralloc);
 		if (bno > 0) {
-#ifdef INVARIANTS
-			mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
 			EXT2_LOCK(ump);
 			ctxp->run.par_physical_start = bno;
 			ctxp->run.par_length = desired_len;
-			ctxp->state = EXT2_ALLOC_ALLOCATED;
-			error = 0;
-			goto out;
+			return (0);
 		}
-		/*
-		 * cluster allocation failed.  ext2_hashalloc and the
-		 * underlying allocator left the lock held on failure.
-		 */
-#ifdef INVARIANTS
-		mtx_assert(EXT2_MTX(ump), MA_OWNED);
-#endif
+		if (logical_length > 1)
+			return (ENOSPC);
 	}
 
-	/*
-	 * If the minimum requirement is more than one block and
-	 * cluster allocation failed, we cannot satisfy the request.
-	 * Return ENOSPC rather than a partial (too-short) run.
-	 */
-	if (logical_length > 1) {
-		error = ENOSPC;
-		goto out;
-	}
-
-	/*
-	 * Single-block fallback for logical_length == 1.
-	 */
-#ifdef INVARIANTS
-	mtx_assert(EXT2_MTX(ump), MA_OWNED);
-#endif
+	/* Single block fallback, which also ends the run attempt. */
 	bno = ext2_hashalloc(ip, cg, bpref, fs->e2fs_bsize, ext2_alloccg);
-	if (bno > 0) {
-#ifdef INVARIANTS
-		mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
-		EXT2_LOCK(ump);
-		ctxp->run.par_physical_start = bno;
-		ctxp->run.par_length = 1;
-		ctxp->state = EXT2_ALLOC_ALLOCATED;
-		error = 0;
-		goto out;
-	}
-#ifdef INVARIANTS
-	mtx_assert(EXT2_MTX(ump), MA_OWNED);
-#endif
-	error = ENOSPC;
-
-out:
-	mtx_assert(EXT2_MTX(ump), MA_OWNED);
-	return (error);
+	if (bno == 0)
+		return (ENOSPC);
+	EXT2_LOCK(ump);
+	ctxp->run.par_physical_start = bno;
+	ctxp->run.par_length = 1;
+	return (0);
 }
 
 /*
- * Rollback an unpublished allocation — adjust inode accounting
- * (i_blocks, i_flag) under EXT2_LOCK, then free the physical blocks.
+ * Undo the inode accounting of an unpublished allocation.  Called
+ * without EXT2_LOCK held; the lock is taken here and dropped before
+ * the blocks themselves are freed by ext2_abort_allocated_runs().
  *
- * This helper unifies the "re-lock / fix i_blocks / unlock / free"
- * sequence that every allocation-failure cleanup path must perform.
- * It replaces hand-written boilerplate at:
- *   - ext2_balloc.c: direct-block, first-indirect, middle-indirect
- *     EFBIG paths and bwrite-error paths
- *   - ext2_extents.c: extent-insertion-failure path
- *
- * Published vs. unpublished:
- *   The blocks passed here MUST NOT be referenced by any on-disk
- *   inode metadata (direct/indirect block pointers, extent records)
- *   at the time of the call.  They are unpublished — allocated and
- *   accounted-for, but not yet wired into the file's block map.
- *   If a pointer to these blocks has already been written to a
- *   buffer that has been committed via bwrite(), the block is no
- *   longer unpublished and this helper must NOT be used.  In that
- *   case the operation is a consistency repair, not an allocation
- *   rollback, and must use ext2_free_published_runs() (a future
- *   helper that uses Soft Update dependency ordering or journaling
- *   to ensure the old pointer is overwritten before the block is
- *   freed).
- *
- * Lock ownership:
- *   Called WITHOUT EXT2_LOCK held (ext2_alloc() and ext4_new_blocks()
- *   both release the lock before returning to the cleanup path).
- *   The helper acquires the lock internally to adjust inode
- *   accounting, then releases it before calling
- *   ext2_abort_allocated_runs() (which itself acquires the lock
- *   inside ext2_blkfree()).
- *
- * Validation is performed by ext2_rollback_inode_accounting_checked()
- * which runs in ALL builds.  The wrapper panics on any validation
- * failure — callers that need recoverable error handling should
- * call the checked variant directly.
- *
- * i_blocks underflow handling:
- *   An i_blocks underflow detected by the checked variant indicates
- *   filesystem corruption, double rollback, or an accounting bug —
- *   NOT a normal caller error.  Under INVARIANTS, the checked
- *   variant panics directly.  In production, it returns EIO and the
- *   wrapper panics.  Both paths result in a panic.
+ * A run whose pointer is already in a buffer written with bwrite() is
+ * published, not unpublished: it must not be rolled back this way.
+ * Validation is done in all builds and a failure panics, because it
+ * means corruption, a double rollback, or an accounting bug.
  */
 void
 ext2_rollback_inode_accounting(struct inode *ip, e4fs_daddr_t phys_start,
@@ -588,18 +353,9 @@ ext2_rollback_inode_accounting(struct inode *ip, e4fs_daddr_t phys_start,
 }
 
 /*
- * Checked variant of ext2_rollback_inode_accounting().
- *
- * Performs all validation in EVERY build (debug and production) and
- * returns errno on failure.  The wrapper panics on error; this
- * variant lets callers that deal with externally derived or
- * potentially corrupted values recover gracefully.
- *
- * Returns 0 on success, or one of:
- *   EDEADLK — EXT2_LOCK held on entry (lock-contract violation)
- *   EINVAL  — invalid phys_start, length, overflow, or range
- *   EFBIG   — run extends past end of filesystem
- *   EIO     — i_blocks underflow (internal accounting inconsistency)
+ * Recoverable variant of the above: 0 on success, EDEADLK if the
+ * caller holds EXT2_LOCK, EINVAL or EFBIG for a run outside the
+ * filesystem, EIO if i_blocks would underflow.
  */
 int
 ext2_rollback_inode_accounting_checked(struct inode *ip,
@@ -622,40 +378,18 @@ ext2_rollback_inode_accounting_checked(struct inode *ip,
 	fs = ip->i_e2fs;
 	ump = ip->i_ump;
 
-	/*
-	 * Validate physical block range.  phys_start must be within
-	 * the filesystem's allocated block range.
-	 */
+	/* phys_start must be a real block of this filesystem. */
 	if (phys_start < (e4fs_daddr_t)le32toh(fs->e2fs->e2fs_first_dblock) ||
 	    (uint64_t)phys_start >= fs->e2fs_bcount)
 		return (EINVAL);
 
-	/*
-	 * Overflow-safe run-end computation.  Verify that
-	 * phys_start + (length - 1) does not wrap uint64_t.
-	 * For length == 1, length - 1 == 0 so no overflow is possible.
-	 * For length > 1, check the sum does not exceed UINT64_MAX.
-	 */
-	if (length > 1) {
-		uint64_t ulen = (uint64_t)length - 1;
-		if ((uint64_t)phys_start > (uint64_t)-1 - ulen)
-			return (EINVAL);
-	}
-	last_block = (uint64_t)phys_start + (length > 0 ? length - 1 : 0);
+	last_block = (uint64_t)phys_start + length - 1;
 	if (last_block >= fs->e2fs_bcount)
 		return (EFBIG);
 
-	/*
-	 * Compute the sector count in uint64_t.  btodb() returns daddr_t
-	 * (int64_t); since e2fs_bsize is always positive and fits in
-	 * uint16_t, the result of btodb() is always a small non-negative
-	 * value.  Multiplying by 'length' (bounded at EXT4_MAX_LEN = 32767
-	 * above) yields a maximum of ~262K sectors for 4 KiB blocks — well
-	 * within uint64_t range.  The cast to uint64_t before multiplication
-	 * prevents any signed-overflow concerns in the intermediate result.
-	 */
 	sectors = (uint64_t)btodb(fs->e2fs_bsize) * length;
 
+	/* An underflow here means corruption or a double rollback. */
 #ifdef INVARIANTS
 	if (ip->i_blocks < sectors)
 		panic("ext2_rollback_inode_accounting_checked: i_blocks "
@@ -666,11 +400,6 @@ ext2_rollback_inode_accounting_checked(struct inode *ip,
 	if (ip->i_blocks < sectors)
 		return (EIO);
 
-	/*
-	 * Adjust inode accounting under the mount lock so the change
-	 * is atomic with respect to other threads that may read or
-	 * modify i_blocks.
-	 */
 	EXT2_LOCK(ump);
 	ip->i_blocks -= sectors;
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
@@ -680,28 +409,9 @@ ext2_rollback_inode_accounting_checked(struct inode *ip,
 }
 
 /*
- * ext2_rollback_unpublished — TRANSITIONAL scalar wrapper for
- * rolling back an unpublished allocation.
- *
- * New code should call ext2_rollback_allocation() with an
- * ext2_alloc_context instead of this scalar variant.  This wrapper
- * synthesizes a minimal context for callers (e.g. ext2_balloc.c
- * EFBIG paths, ext4_ext_get_blocks extent-insertion-failure path)
- * that do not have the allocation context available.
- *
- * Delegates to:
- *   1. ext2_rollback_inode_accounting() — validates all preconditions
- *      (no lock held, non-zero start/length, length <= EXT4_MAX_LEN,
- *      block range valid, i_blocks non-underflowing) and adjusts
- *      inode accounting under EXT2_LOCK.
- *   2. ext2_abort_allocated_runs() — frees the physical blocks via
- *      ext2_blkfree() (manages its own locking).
- *
- * See ext2_extern.h for the full contract.  Replaces hand-written
- * boilerplate at:
- *   - ext2_balloc.c: direct-block, first-indirect, middle-indirect
- *     EFBIG paths and bwrite-error paths
- *   - ext2_extents.c: extent-insertion-failure path
+ * Scalar variant of ext2_rollback_allocation() for callers that do not
+ * have an allocation context at hand: they must already have applied
+ * the accounting they are undoing.
  */
 void
 ext2_rollback_unpublished(struct inode *ip, e4fs_daddr_t phys_start,
@@ -709,18 +419,8 @@ ext2_rollback_unpublished(struct inode *ip, e4fs_daddr_t phys_start,
 {
 	struct ext2_alloc_context ctx;
 
-	/*
-	 * TRANSITIONAL INTERFACE — new code should use
-	 * ext2_rollback_allocation() with a properly tracked
-	 * ext2_alloc_context instead of this scalar variant.
-	 * This wrapper synthesizes a minimal context for callers
-	 * (e.g. ext2_balloc.c EFBIG paths and bwrite-error paths
-	 * in the non-extent allocation path) that do not have an
-	 * ext2_alloc_context available.
-	 */
 	bzero(&ctx, sizeof(ctx));
 	ctx.ip = ip;
-	ctx.logical_start = 0;
 	ctx.logical_length = length;
 	ctx.run.par_physical_start = phys_start;
 	ctx.run.par_length = length;
@@ -729,27 +429,9 @@ ext2_rollback_unpublished(struct inode *ip, e4fs_daddr_t phys_start,
 }
 
 /*
- * ext2_rollback_allocation — context-based rollback of an unpublished
- * allocation run.
- *
- * Validates the allocation lifecycle state, then:
- *   1. If accounting_applied: revert i_blocks and i_flag via
- *      ext2_rollback_inode_accounting() (acquires EXT2_LOCK internally).
- *   2. Free physical blocks via ext2_abort_allocated_runs() (calls
- *      ext2_blkfree which manages its own locking).
- *   3. Clear stale allocation hints (i_next_alloc_block/goal).
- *   4. Set state to ROLLED_BACK.
- *
- * State machine (see enum ext2_alloc_state):
- *   Permitted entry states: ALLOCATED, MAPPED.
- *   Forbidden entry states: PUBLISHED, ROLLED_BACK
- *      (blocks may be referenced by committed metadata or already
- *      rolled back).
- *
- * Programmer-contract checks use KASSERT.  Operational failures
- * (invalid ranges, i_blocks underflow) are handled internally
- * by ext2_rollback_inode_accounting_checked() which may panic with
- * context under INVARIANTS.
+ * Undo an allocation that is still unpublished: revert the inode
+ * accounting, free the physical run, drop the allocation hints and
+ * mark the context ROLLED_BACK.  The context is consumed here.
  */
 void
 ext2_rollback_allocation(struct ext2_alloc_context *ctxp)
@@ -758,11 +440,7 @@ ext2_rollback_allocation(struct ext2_alloc_context *ctxp)
 
 	KASSERT(ctxp != NULL, ("ext2_rollback_allocation: NULL context"));
 
-	/*
-	 * State validation: never roll back published blocks.
-	 * PUBLISHED and ROLLED_BACK are terminal — rollback must not
-	 * touch them.  This is a programmer-contract check.
-	 */
+	/* Published and rolled back are terminal; never roll those back. */
 	KASSERT(ctxp->state == EXT2_ALLOC_ALLOCATED ||
 	    ctxp->state == EXT2_ALLOC_MAPPED,
 	    ("ext2_rollback_allocation: rollback from state %d",
@@ -770,26 +448,15 @@ ext2_rollback_allocation(struct ext2_alloc_context *ctxp)
 
 	ump = ctxp->ip->i_ump;
 
-	/*
-	 * Undo inode accounting if it was applied by
-	 * ext2_commit_allocated_block().
-	 */
 	if (ctxp->accounting_applied)
 		ext2_rollback_inode_accounting(ctxp->ip,
 		    ctxp->run.par_physical_start, ctxp->run.par_length);
 
-	/*
-	 * Free the physical blocks.  ext2_abort_allocated_runs() calls
-	 * ext2_blkfree() which acquires EXT2_LOCK internally.
-	 */
 	if (ctxp->run.par_physical_start != 0 &&
 	    ctxp->run.par_length > 0)
 		ext2_abort_allocated_runs(ctxp->ip, &ctxp->run);
 
-	/*
-	 * Clear stale allocation hints so they are not reused after
-	 * rollback.
-	 */
+	/* Drop the hints the rolled back run may have left behind. */
 	EXT2_LOCK(ump);
 	ctxp->ip->i_next_alloc_block = 0;
 	ctxp->ip->i_next_alloc_goal = 0;
@@ -800,18 +467,10 @@ ext2_rollback_allocation(struct ext2_alloc_context *ctxp)
 }
 
 /*
- * ext2_commit_allocated_block — finalize inode accounting and
- * allocation hints for a successfully allocated (but not yet
- * published) block run.
- *
- * Called by the mapping layer after ext2_alloc_run() succeeds and
- * before the physical block is installed into on-disk inode metadata.
- * Updates:
- *   - i_blocks (sector count for the allocated run)
- *   - i_next_alloc_block / i_next_alloc_goal (sequential allocation hints)
- *   - i_flag (IN_CHANGE | IN_UPDATE)
- *
- * Must be called WITH EXT2_LOCK held.
+ * Account for a freshly allocated, not yet published run.  Must be
+ * called with EXT2_LOCK held.  i_next_alloc_goal is left pointing at
+ * the block after the run, which is what ext2_blkpref() wants as the
+ * physical continuation hint for the next sequential allocation.
  */
 void
 ext2_commit_allocated_block(struct inode *ip,
@@ -826,21 +485,6 @@ ext2_commit_allocated_block(struct inode *ip,
 	if (ctxp->accounting_applied)
 		return;
 
-	/*
-	 * Record the physical block number for the next allocation hint.
-	 * i_next_alloc_block tracks the logical block that was just
-	 * allocated; i_next_alloc_goal is the physical goal for the
-	 * next sequential allocation.  For multi-block runs the hint
-	 * points to the block after the allocated run to encourage
-	 * contiguity.
-	 *
-	 * Invariant: i_next_alloc_goal is the preferred physical
-	 * continuation after the last successful allocation for this
-	 * inode.  It is consumed by ext2_blkpref() when
-	 * i_next_alloc_block == logical_start, indicating sequential
-	 * allocation.  It is cleared on rollback to prevent reuse of
-	 * stale preferences.
-	 */
 	ip->i_blocks += (uint64_t)btodb(fs->e2fs_bsize) * ctxp->run.par_length;
 	ip->i_next_alloc_block = ctxp->logical_start;
 	ip->i_next_alloc_goal = ctxp->run.par_physical_start + ctxp->run.par_length;
@@ -850,16 +494,8 @@ ext2_commit_allocated_block(struct inode *ip,
 }
 
 /*
- * ext2_alloc_transition — enforce a state-machine transition on an
- * allocation context.
- *
- * This is the only sanctioned way to advance the allocation state.
- * Callers must NOT assign ctxp->state directly after initialization
- * (the initial ALLOCATED state is an exception, set by ext2_alloc_run).
- *
- * Broken internal contracts are assertions (KASSERT), not production
- * error paths.  The control flow of callers is responsible for
- * reaching each transition in order.
+ * The only sanctioned way to move a context to a new state; anything
+ * else is a broken internal contract and asserts.
  */
 void
 ext2_alloc_transition(struct ext2_alloc_context *ctxp,
@@ -888,42 +524,13 @@ ext2_alloc_transition(struct ext2_alloc_context *ctxp,
 }
 
 /*
- * Abort an unpublished allocation — free blocks that were allocated
- * by ext2_alloc_run() but never became reachable from persistent
- * inode metadata.
+ * Free a run that no on-disk metadata references.  Does not touch
+ * i_blocks and must not be used on a published run: a block whose
+ * pointer reached the disk may only be freed once the Soft Updates
+ * dependency ordering guarantees the stale pointer is gone.
  *
- * Published vs. unpublished distinction:
- *   This function is ONLY for blocks allocated but not yet referenced
- *   by on-disk inode metadata (direct block pointers, indirect block
- *   entries, or extent records).  The block was allocated, i_blocks
- *   was incremented, but the block number was never stored into any
- *   metadata buffer that was committed via bwrite().
- *
- *   If a pointer to the block has been written to a buffer and that
- *   buffer has been bwrite()'d, the block is PUBLISHED.  Do NOT use
- *   this function for published blocks — use the future
- *   ext2_free_published_runs() instead, which respects
- *   dependency ordering via Soft Updates or journaling.
- *
- *   | Situation                              | Action             |
- *   |----------------------------------------|--------------------|
- *   | Allocation failed before publication   | Rollback immediately
- *   | Metadata init failed before pub        | Rollback after release
- *   | Extent insertion failed before pub     | Rollback immediately
- *   | Block was published then replaced      | ext2_free_published_runs (future)
- *   | Block reachable from committed metadata| Never use abort helper
- *
- * Contract:
- *   - Lock ownership: does NOT require EXT2_LOCK.  ext2_blkfree()
- *     acquires it internally.
- *   - Publication state: run MUST be unpublished (see table above).
- *   - i_blocks: does NOT change i_blocks or i_flag.  The caller
- *     (ext2_rollback_unpublished()) handles i_blocks BEFORE calling
- *     this function.
- *   - Sleep: may sleep (ext2_blkfree calls brelse, which can block).
- *   - Buffer ownership: may be called with caller-held buffers, but
- *     this function does NOT release them.  The caller retains
- *     ownership of all buffers.
+ * Takes no lock of its own (ext2_blkfree() locks), may sleep, and
+ * leaves the caller's buffers alone.
  */
 void
 ext2_abort_allocated_runs(struct inode *ip, struct ext2_alloc_run *runp)
@@ -965,10 +572,8 @@ static int doreallocblks = 0;
 SYSCTL_INT(_vfs_ext2fs, OID_AUTO, doreallocblks, CTLFLAG_RW, &doreallocblks, 0, "");
 
 /*
- * sysctl handler for ext2_alloc_max_run:
- * Validates that the value is a positive integer within the valid
- * range [1, EXT4_MAX_LEN].  Rejects negative values that would
- * become huge unsigned values when cast to uint32_t.
+ * sysctl handler for ext2_alloc_max_run: clamp to the range an extent
+ * record can express, and never let a negative value wrap around.
  */
 static int
 sysctl_ext2_alloc_max_run(SYSCTL_HANDLER_ARGS)
@@ -991,7 +596,8 @@ sysctl_ext2_alloc_max_run(SYSCTL_HANDLER_ARGS)
 
 SYSCTL_PROC(_vfs_ext2fs, OID_AUTO, alloc_max_run, CTLTYPE_INT | CTLFLAG_RW,
     0, 0, sysctl_ext2_alloc_max_run, "I",
-    "Maximum physical allocation run length");
+    "Upper bound on the length of a contiguous allocation run; the "
+    "superblock preallocation size is the target for sequential data");
 
 int
 ext2_reallocblks(struct vop_reallocblks_args *ap)
@@ -1542,11 +1148,9 @@ ext2_blkpref(struct inode *ip, e2fs_lbn_t lbn, int indx, e2fs_daddr_t *bap,
  *   2) quadratically rehash on the cylinder group number.
  *   3) brute force search for a free block.
  *
- * Lock contract:
- *   Entry: EXT2_LOCK held (asserted via mtx_assert at entry).
- *   On success: releases EXT2_LOCK (allocator callback frees it).
- *   On failure: returns 0 with EXT2_LOCK still held.
- *   Callers in ext2_alloc_run() re-lock after success.
+ * Lock contract: EXT2_LOCK held on entry; the allocator callback
+ * drops it on success, so the caller has to take it again.  On
+ * failure the lock is still held and the caller may rehash.
  */
 static e4fs_daddr_t
 ext2_hashalloc(struct inode *ip, int cg, long pref, int size,
@@ -1796,16 +1400,9 @@ ext2_b_bitmap_validate(struct m_ext2fs *fs, struct buf *bp, int cg)
 /*
  * Determine whether a block can be allocated.
  *
- * Callback contract (called by ext2_hashalloc):
- *   - Entry: EXT2_LOCK held.
- *   - Allocates EXACTLY one block on success.
- *   - Returns physical block number on success; releases EXT2_LOCK
- *     before returning.
- *   - Returns 0 on failure; allocates nothing; leaves EXT2_LOCK held.
- *   - `size` parameter is the block size in bytes (ignored for
- *     bitmap search — always allocates one block).
- *   - Bitmap updates and free-space accounting (e2fs_fbcount,
- *     e2fs_gd[cg] nbfree) are performed atomically under the lock.
+ * ext2_hashalloc() callback: on success exactly one block is marked
+ * used, EXT2_LOCK is dropped and the block number is returned; on
+ * failure nothing is allocated and EXT2_LOCK is left held.
  */
 static daddr_t
 ext2_alloccg(struct inode *ip, int cg, daddr_t bpref, int size)
@@ -1822,9 +1419,7 @@ ext2_alloccg(struct inode *ip, int cg, daddr_t bpref, int size)
 	if (e2fs_gd_get_nbfree(&fs->e2fs_gd[cg]) == 0)
 		return (0);
 
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_OWNED);
-#endif
 	EXT2_UNLOCK(ump);
 	error = bread(ip->i_devvp, fsbtodb(fs,
 	    e2fs_gd_get_b_bitmap(&fs->e2fs_gd[cg])),
@@ -1939,9 +1534,7 @@ gotit:
 	}
 #endif
 	setbit(bbp, bno);
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
 	EXT2_LOCK(ump);
 	ext2_clusteracct(fs, bbp, cg, bno, -1);
 	fs->e2fs_fbcount--;
@@ -1956,9 +1549,7 @@ gotit:
 
 fail:
 	brelse(bp);
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
 	EXT2_LOCK(ump);
 	return (0);
 }
@@ -1966,17 +1557,10 @@ fail:
 /*
  * Determine whether a cluster can be allocated.
  *
- * Callback contract (called by ext2_hashalloc):
- *   - Entry: EXT2_LOCK held.
- *   - Allocates EXACTLY `len` contiguous blocks on success.
- *   - Returns physical block number (relative to filesystem start)
- *     on success; releases EXT2_LOCK before returning.
- *   - Returns 0 on failure; allocates nothing; leaves EXT2_LOCK held.
- *   - `len` is a block count, NOT a byte count.
- *   - Bitmap updates and free-space accounting (e2fs_fbcount,
- *     e2fs_gd[cg] nbfree) are performed atomically under the lock.
- *   - If the bitmap does not contain a run of exactly `len` free
- *     blocks, returns 0 with the lock held (no partial allocation).
+ * ext2_hashalloc() callback: `len` is a block count, not a byte
+ * count.  On success exactly len contiguous blocks are marked used,
+ * EXT2_LOCK is dropped and the first block is returned; on failure
+ * nothing is allocated and EXT2_LOCK is left held.
  */
 static daddr_t
 ext2_clusteralloc(struct inode *ip, int cg, daddr_t bpref, int len)
@@ -1995,9 +1579,7 @@ ext2_clusteralloc(struct inode *ip, int cg, daddr_t bpref, int len)
 	if (fs->e2fs_maxcluster[cg] < len)
 		return (0);
 
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_OWNED);
-#endif
 	EXT2_UNLOCK(ump);
 	error = bread(ip->i_devvp,
 	    fsbtodb(fs, e2fs_gd_get_b_bitmap(&fs->e2fs_gd[cg])),
@@ -2006,9 +1588,7 @@ ext2_clusteralloc(struct inode *ip, int cg, daddr_t bpref, int len)
 		goto fail_lock;
 
 	bbp = (char *)bp->b_data;
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
 	EXT2_LOCK(ump);
 	/*
 	 * Check to see if a cluster of the needed size (or bigger) is
@@ -2032,9 +1612,7 @@ ext2_clusteralloc(struct inode *ip, int cg, daddr_t bpref, int len)
 		fs->e2fs_maxcluster[cg] = i;
 		goto fail;
 	}
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
 	EXT2_UNLOCK(ump);
 
 	/* Search the bitmap to find a big enough cluster like in FFS. */
@@ -2088,9 +1666,7 @@ ext2_clusteralloc(struct inode *ip, int cg, daddr_t bpref, int len)
 	    + bno);
 
 fail_lock:
-#ifdef INVARIANTS
 	mtx_assert(EXT2_MTX(ump), MA_NOTOWNED);
-#endif
 	EXT2_LOCK(ump);
 fail:
 	brelse(bp);

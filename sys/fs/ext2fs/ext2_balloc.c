@@ -120,12 +120,9 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 	/*
 	 * check if this is a sequential block allocation.
 	 * If so, increment i_next_alloc_block to allow ext2_blkpref
-	 * to make a good guess.
-	 *
-	 * Note: i_next_alloc_goal is no longer incremented here —
-	 * ext2_commit_allocated_block() now sets it to
-	 * par_physical_start + par_length after each allocation,
-	 * which correctly points to the preferred continuation block.
+	 * to make a good guess.  i_next_alloc_goal is left to
+	 * ext2_commit_allocated_block(), which points it past the run
+	 * that was just allocated.
 	 */
 	if (lbn == ip->i_next_alloc_block + 1)
 		ip->i_next_alloc_block++;
@@ -160,12 +157,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 			 * we can not use it in file block maps.
 			 */
 			if (newb > UINT_MAX) {
-				/*
-				 * Block is unpublished: ext2_alloc() returned
-				 * it via newb but we have not yet installed it
-				 * in i_db[lbn].  ext2_rollback_unpublished()
-				 * handles lock/re-accounting/free atomically.
-				 */
+				/* Not installed in i_db[] yet, so still free. */
 				ext2_rollback_unpublished(ip, newb, 1);
 				return (EFBIG);
 			}
@@ -203,10 +195,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		if (error)
 			return (error);
 		if (newb > UINT_MAX) {
-			/*
-			 * Block is unpublished: ext2_alloc() returned it but
-			 * we have not yet installed it in i_ib[].
-			 */
+			/* Not installed in i_ib[] yet, so still free. */
 			ext2_rollback_unpublished(ip, newb, 1);
 			return (EFBIG);
 		}
@@ -219,11 +208,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * never point at garbage.
 		 */
 		if ((error = bwrite(bp)) != 0) {
-			/*
-			 * bwrite failed after allocating the indirect block.
-			 * The block is unpublished: pref was set but not yet
-			 * stored in ip->i_ib[].  bwrite already released bp.
-			 */
+			/* bwrite() released bp; pref is still unreferenced. */
 			ext2_rollback_unpublished(ip, pref, 1);
 			return (error);
 		}
@@ -258,11 +243,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 			return (error);
 		}
 		if (newb > UINT_MAX) {
-			/*
-			 * Block is unpublished: ext2_alloc() returned it but
-			 * we have not yet installed it in bap[].  bp (parent
-			 * indirect block) is still held and must be released.
-			 */
+			/* Not installed in bap[] yet, so still free. */
 			ext2_rollback_unpublished(ip, newb, 1);
 			brelse(bp);
 			return (EFBIG);
@@ -276,13 +257,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * never point at garbage.
 		 */
 		if ((error = bwrite(nbp)) != 0) {
-			/*
-			 * bwrite failed after allocating the indirect block.
-			 * The block is unpublished (pref not yet stored in
-			 * bap[]).  bwrite already released nbp; bp is still
-			 * held as the parent indirect block and must be
-			 * released.
-			 */
+			/* bwrite() released nbp; pref is still unreferenced. */
 			ext2_rollback_unpublished(ip, pref, 1);
 			brelse(bp);
 			return (error);
@@ -297,13 +272,8 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		if (flags & IO_SYNC) {
 			if ((error = bwrite(bp)) != 0) {
 				/*
-				 * bwrite of the parent indirect block
-				 * failed after the child indirect block
-				 * (pref) was allocated, i_blocks was
-				 * incremented, and the child was written.
-				 * The child is now orphaned: it exists on
-				 * disk but is not reachable from the
-				 * inode.  Roll it back.
+				 * The child indirect block is on disk but
+				 * unreachable: the parent that names it is not.
 				 */
 				ext2_rollback_unpublished(ip, pref, 1);
 				bp = NULL;
@@ -321,54 +291,32 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 	 */
 	if (pref == 0) {
 		/*
-		 * Allocate the data block.  In the traditional (non-extent)
-		 * mapping path, only one logical block is mapped per call,
-		 * so we use EXT2_ALLOC_DATA_RAND to avoid silently
-		 * preallocating blocks the caller cannot install into the
-		 * indirect block array.
+		 * The traditional path maps one logical block per call, so
+		 * it asks for a single block: a longer run would be blocks
+		 * this call cannot install into the indirect array.
 		 */
 		EXT2_LOCK(ump);
 		if (fs->e2fs_fbcount == 0)
 			goto nospace;
 		bpref = ext2_blkpref(ip, lbn, indirs[i].in_off, &bap[0],
 		    bp->b_lblkno);
+		/* Returns with EXT2_LOCK held, also on failure. */
 		error = ext2_alloc_run(ip, lbn, 1, bpref,
 		    EXT2_ALLOC_DATA_RAND, cred, &ctx);
-		/*
-		 * Lock contract: ext2_alloc_run returns with lock held.
-		 * On failure, goto nospace (which unlocks).
-		 */
 		if (error)
 			goto nospace;
-		/*
-		 * ext2_alloc_run succeeded; lock is still held.
-		 * Commit inode accounting (i_blocks, hints, flags) under
-		 * the lock.  ext2_commit_allocated_block modifies i_blocks,
-		 * i_next_alloc_block/goal, and i_flag — all require the lock.
-		 */
 		pref = ctx.run.par_physical_start;
 		ext2_commit_allocated_block(ip, &ctx);
 
 		/*
-		 * Release the lock before any buffer I/O.  getblk(),
-		 * vfs_bio_clrbuf(), bwrite(), and bdwrite() can all sleep
-		 * (via the buffer cache / VM subsystem), and holding
-		 * EXT2_LOCK across them triggers witness warnings and
-		 * potential deadlocks.
-		 *
-		 * The in-memory inode state has already been updated under
-		 * the lock by ext2_commit_allocated_block().  The buffer
-		 * modifications below (bap[] write, bwrite/bdwrite) operate
-		 * on bp/nbp which are separately locked by the buffer cache.
+		 * Drop the lock before any buffer I/O: getblk(),
+		 * vfs_bio_clrbuf(), bwrite() and bdwrite() can sleep, and
+		 * the inode accounting above is already done.
 		 */
 		EXT2_UNLOCK(ump);
 
 		if (pref > UINT_MAX) {
-			/*
-			 * The block is unpublished: pref was assigned but not
-			 * yet stored in bap[] or nbp's b_blkno.  No lock is
-			 * held; ext2_rollback_allocation acquires it internally.
-			 */
+			/* Not installed in bap[] yet, so still free. */
 			ext2_rollback_allocation(&ctx);
 			brelse(bp);
 			return (EFBIG);
@@ -386,18 +334,9 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		if (flags & IO_SYNC) {
 			if ((error = bwrite(bp)) != 0) {
 				/*
-				 * bwrite failed for the parent indirect
-				 * block after the data block was
-				 * allocated, committed, and its pointer
-				 * installed in the in-memory indirect
-				 * block.  Roll back the allocation,
-				 * release the data buffer, and return
-				 * the I/O error.
-				 *
-				 * Safe to rollback: state is MAPPED
-				 * (not yet PUBLISHED) — the
-				 * PUBLISHED transition has not
-				 * occurred because bwrite failed.
+				 * The parent indirect block did not reach
+				 * the disk, so the run is still unpublished
+				 * and can be rolled back.
 				 */
 				ext2_rollback_allocation(&ctx);
 				brelse(nbp);
@@ -434,11 +373,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 	*bpp = nbp;
 	return (0);
 nospace:
-	/*
-  * Reached only via goto from pre-check failures (fbcount == 0)
-  * or ext2_alloc_run() failure, both of which leave EXT2_LOCK held.
-	 */
-	mtx_assert(EXT2_MTX(ump), MA_OWNED);
+	/* Both paths into this label leave EXT2_LOCK held. */
 	brelse(bp);
 	EXT2_UNLOCK(ump);
 	SDT_PROBE2(ext2fs, , alloc, trace, 1, "cannot allocate data block");
