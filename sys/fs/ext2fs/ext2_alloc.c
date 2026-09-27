@@ -567,9 +567,13 @@ static int doasyncfree = 1;
 SYSCTL_INT(_vfs_ext2fs, OID_AUTO, doasyncfree, CTLFLAG_RW, &doasyncfree, 0,
     "Use asynchronous writes to update block pointers when freeing blocks");
 
-static int doreallocblks = 0;
+/*
+ * Gate for VOP_REALLOCBLKS.  Shared with ext4_reallocblks() so that the
+ * tuning knob covers extent-mapped files as well.
+ */
+int ext2_doreallocblks = 0;
 
-SYSCTL_INT(_vfs_ext2fs, OID_AUTO, doreallocblks, CTLFLAG_RW, &doreallocblks, 0, "");
+SYSCTL_INT(_vfs_ext2fs, OID_AUTO, doreallocblks, CTLFLAG_RW, &ext2_doreallocblks, 0, "");
 
 /*
  * sysctl handler for ext2_alloc_max_run: clamp to the range an extent
@@ -615,7 +619,7 @@ ext2_reallocblks(struct vop_reallocblks_args *ap)
 	e2fs_daddr_t newblk, blkno;
 	int i, len, start_lvl, end_lvl, pref, ssize;
 
-	if (doreallocblks == 0)
+	if (ext2_doreallocblks == 0)
 		return (ENOSPC);
 
 	vp = ap->a_vp;
@@ -623,7 +627,11 @@ ext2_reallocblks(struct vop_reallocblks_args *ap)
 	fs = ip->i_e2fs;
 	ump = ip->i_ump;
 
-	if (fs->e2fs_contigsumsize <= 0 || ip->i_flag & IN_E4EXTENTS)
+	/* Extent-mapped files relocate a whole extent instead. */
+	if (ip->i_flag & IN_E4EXTENTS)
+		return (ext4_reallocblks(ap));
+
+	if (fs->e2fs_contigsumsize <= 0)
 		return (ENOSPC);
 
 	buflist = ap->a_buflist;

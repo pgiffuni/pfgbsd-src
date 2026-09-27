@@ -38,6 +38,7 @@
 #include <sys/conf.h>
 #include <sys/sdt.h>
 #include <sys/stat.h>
+#include <sys/proc.h>
 
 #include <fs/ext2fs/ext2_mount.h>
 #include <fs/ext2fs/fs.h>
@@ -53,6 +54,8 @@ SDT_PROVIDER_DECLARE(ext2fs);
  * arg1: Textual message
  */
 SDT_PROBE_DEFINE2(ext2fs, , trace, extents, "int", "char*");
+SDT_PROBE_DEFINE3(ext2fs, , alloc, ext4_reallocblks_realloc, "int", "int",
+    "int");
 
 static MALLOC_DEFINE(M_EXT2EXTENTS, "ext2_extents", "EXT2 extents");
 
@@ -1869,4 +1872,189 @@ out:
 
 	ip->i_ext_cache.ec_type = EXT4_EXT_CACHE_NO;
 	return (error);
+}
+
+/*
+ * ext4_ext_realloc_extent — repoint one whole extent at a new physical run.
+ *
+ * Only the physical start changes.  The logical start and length stay put, so
+ * the tree keeps its shape: no leaf is split, no index is touched, and the
+ * leaf cannot move.  The caller must already have established that the extent
+ * covers exactly the logical range it means to relocate.
+ *
+ * The rewrite is the publication point, so this must be called with the
+ * allocation context in the MAPPED state.  If the tree cannot be written the
+ * in-memory copy is put back to the old run, which leaves the tree naming the
+ * blocks that are still on disk, and the caller may roll its allocation back.
+ */
+static int
+ext4_ext_realloc_extent(struct inode *ip, struct ext4_extent_path *path,
+    e4fs_daddr_t new_start)
+{
+	e4fs_daddr_t old_start;
+	int error;
+
+	old_start = ext4_ext_extent_pblock(path->ep_ext);
+	ext4_ext_store_pblock(path->ep_ext, new_start);
+	error = ext4_ext_dirty(ip, path);
+	if (error) {
+		ext4_ext_store_pblock(path->ep_ext, old_start);
+		return (error);
+	}
+
+	/* Any cached mapping still names the old run. */
+	ip->i_ext_cache.ec_type = EXT4_EXT_CACHE_NO;
+	return (0);
+}
+
+/*
+ * ext4_reallocblks — relocate an extent-mapped cluster onto one contiguous run.
+ *
+ * The buffer cache hands us a logically consecutive cluster of buffers whose
+ * physical blocks are scattered.  When those logical blocks are exactly one
+ * existing extent, the extent can be repointed at a freshly allocated
+ * contiguous run with no change to the shape of the tree.
+ *
+ * The scope is deliberately narrow.  The cluster has to match a whole extent
+ * and the replacement run has to be exactly as long; anything else is refused
+ * and the existing allocation stands.  Refusing costs locality, while
+ * attempting a split, a merge or a new leaf would mean exercising the whole
+ * insertion machinery for what is an optimisation.
+ *
+ * Ordering is what makes this safe.  The replacement run is allocated and the
+ * extent is rewritten before the old blocks are freed, so a failure anywhere
+ * up to the rewrite leaves the on-disk extent naming blocks that are still
+ * allocated.  The one asymmetric case is failing to free the old blocks after
+ * a successful rewrite: the file is correct and the space is leaked, which
+ * soft updates can reclaim later.  Freeing is therefore deliberately kept
+ * outside the allocator's rollback.
+ */
+int
+ext4_reallocblks(struct vop_reallocblks_args *ap)
+{
+	struct cluster_save *buflist;
+	struct ext2_alloc_context ctx;
+	struct ext4_extent_path *path;
+	struct ext4_extent *ex;
+	struct m_ext2fs *fs;
+	struct ext2mount *ump;
+	struct inode *ip;
+	struct vnode *vp;
+	e4fs_daddr_t old_start, old_blk, blkno;
+	e2fs_lbn_t start_lbn;
+	uint16_t depth, extent_len;
+	uint32_t i, len;
+	int error, pref;
+
+	vp = ap->a_vp;
+	ip = VTOI(vp);
+	fs = ip->i_e2fs;
+	ump = ip->i_ump;
+
+	if (ext2_doreallocblks == 0)
+		return (ENOSPC);
+
+	/* This path only makes sense for an extent-mapped inode. */
+	if ((ip->i_flag & IN_E4EXTENTS) == 0)
+		return (ENOSPC);
+
+	buflist = ap->a_buflist;
+	len = buflist->bs_nchildren;
+	if (len == 0 || len > EXT4_MAX_LEN)
+		return (ENOSPC);
+	start_lbn = buflist->bs_children[0]->b_lblkno;
+	for (i = 1; i < len; i++)
+		if (buflist->bs_children[i]->b_lblkno != start_lbn + i)
+			return (ENOSPC);
+	/*
+	 * Locate the extent.  It must begin at the cluster and be exactly as
+	 * long as the cluster, otherwise relocating it would mean splitting
+	 * or trimming the tree.  An e_len above EXT4_MAX_LEN marks an
+	 * uninitialised extent, which has no physical mapping to move yet.
+	 */
+	path = NULL;
+	if (ext4_ext_find_extent(ip, start_lbn, &path) != 0)
+		return (ENOSPC);
+	ex = path[depth = ext4_ext_inode_depth(ip)].ep_ext;
+	if (ex == NULL)
+		goto refuse;
+	extent_len = le16toh(ex->e_len);
+	if (extent_len == 0 || extent_len > EXT4_MAX_LEN)
+		goto refuse;
+	if (le32toh(ex->e_blk) != start_lbn || extent_len != len)
+		goto refuse;
+	old_start = ext4_ext_extent_pblock(ex);
+	/*
+	 * The cluster must be sitting on the blocks the extent names.  We are
+	 * about to free them, so anything still referring to them has to be
+	 * accounted for; the buffers are the only such referrer, and they are
+	 * about to be redirected.
+	 */
+	for (i = 0; i < len; i++)
+		if (buflist->bs_children[i]->b_blkno !=
+		    fsbtodb(fs, old_start + (e4fs_daddr_t)i * fs->e2fs_fpb))
+			goto refuse;
+	pref = ext4_ext_blkpref(ip, path, start_lbn);
+
+	/*
+	 * Ask for exactly the blocks the extent covers.  DATA_RAND keeps the
+	 * sequential preallocation target out of it, since overshooting the
+	 * extent would leave a run that cannot be used.
+	 */
+	EXT2_LOCK(ump);
+	error = ext2_alloc_run(ip, start_lbn, len, pref,
+	    EXT2_ALLOC_DATA_RAND, curthread->td_ucred, &ctx);
+	if (error) {
+		EXT2_UNLOCK(ump);
+		goto refuse;
+	}
+	EXT2_UNLOCK(ump);
+
+	/*
+	 * Deliberately no ext2_commit_allocated_block() here.  That helper
+	 * charges the new run to i_blocks, and ext2_blkfree() does not credit
+	 * anything back, so committing would inflate i_blocks by the length of
+	 * the run for good.  A relocation leaves the number of blocks charged
+	 * to the inode unchanged, which is also why ext2_reallocblks() does
+	 * not commit either.
+	 */
+	if (ctx.run.par_length != len) {
+		ext2_rollback_allocation(&ctx);
+		goto refuse;
+	}
+
+	/* The extent names the new run in memory. */
+	ext2_alloc_transition(&ctx, EXT2_ALLOC_MAPPED);
+	error = ext4_ext_realloc_extent(ip, path,
+	    ctx.run.par_physical_start);
+	if (error) {
+		ext2_rollback_allocation(&ctx);
+		goto refuse;
+	}
+	/* The new run is reachable from the on-disk inode. */
+	ext2_alloc_transition(&ctx, EXT2_ALLOC_PUBLISHED);
+
+	SDT_PROBE3(ext2fs, , alloc, ext4_reallocblks_realloc,
+	    ip->i_number, start_lbn, old_start);
+
+	/*
+	 * Nothing refers to the old blocks now, so release them and point the
+	 * cluster at the run the extent names.  The two are interleaved so a
+	 * buffer is never left referring to a block that has been freed.
+	 */
+	for (i = 0, old_blk = old_start, blkno = ctx.run.par_physical_start;
+	    i < len; i++, old_blk += fs->e2fs_fpb, blkno += fs->e2fs_fpb) {
+		ext2_blkfree(ip, old_blk, fs->e2fs_bsize);
+		buflist->bs_children[i]->b_blkno = fsbtodb(fs, blkno);
+	}
+
+	ext4_ext_drop_refs(path);
+	free(path, M_EXT2EXTENTS);
+	return (0);
+refuse:
+	if (path != NULL) {
+		ext4_ext_drop_refs(path);
+		free(path, M_EXT2EXTENTS);
+	}
+	return (ENOSPC);
 }

@@ -323,6 +323,14 @@ void	ext2_commit_allocated_block(struct inode *, struct ext2_alloc_context *);
  */
 void	ext2_alloc_transition(struct ext2_alloc_context *,
 	    enum ext2_alloc_state);
+
+/*
+ * ext2_doreallocblks — sysctl gate for VOP_REALLOCBLKS.  Non-zero lets the
+ * buffer cache ask us to relocate a cluster onto contiguous blocks.  Both
+ * ext2_reallocblks() and ext4_reallocblks() honour it.
+ */
+extern int	ext2_doreallocblks;
+
 int	ext2_balloc(struct inode *,
 	    e2fs_lbn_t, int, struct ucred *, struct buf **, int);
 int	ext2_blkatoff(struct vnode *, off_t, char **, struct buf **);
@@ -340,6 +348,7 @@ int	ext2_getlbns(struct vnode *, daddr_t, struct indir *, int *);
 int	ext2_i2ei(struct inode *, struct ext2fs_dinode *);
 void	ext2_itimes(struct vnode *vp);
 int	ext2_reallocblks(struct vop_reallocblks_args *);
+int	ext4_reallocblks(struct vop_reallocblks_args *);
 int	ext2_reclaim(struct vop_reclaim_args *);
 int	ext2_truncate(struct vnode *, off_t, int, struct ucred *, struct thread *);
 int	ext2_update(struct vnode *, int);
