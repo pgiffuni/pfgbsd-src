@@ -586,14 +586,6 @@ ext2_compute_sb_data(struct vnode *devvp, struct ext2fs *es,
 
 	fs->e2fs_itpg = fs->e2fs_ipg / fs->e2fs_ipb;
 
-	/*
-	 * s_prealloc_blocks is the filesystem's own statement of how many
-	 * blocks a sequential allocation would like to get at once.  It is
-	 * only a policy input for ext2_run_desired_length(); a zero value
-	 * simply means the filesystem asks for no preallocation.
-	 */
-	fs->e2fs_prealloc = es->e2fs_prealloc;
-
 	fs->e2fs_bcount = le32toh(es->e2fs_bcount);
 	fs->e2fs_rbcount = le32toh(es->e2fs_rbcount);
 	fs->e2fs_fbcount = le32toh(es->e2fs_fbcount);

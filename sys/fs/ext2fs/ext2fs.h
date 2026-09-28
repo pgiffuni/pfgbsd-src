@@ -183,8 +183,6 @@ struct m_ext2fs {
 	int32_t  e2fs_uhash;	  /* 3 if hash should be signed, 0 if not */
 	uint32_t e2fs_csum_seed;  /* sb checksum seed */
 	uint64_t e2fs_maxsymlinklen; /* max size of short symlink */
-	uint8_t  e2fs_prealloc;	  /* blocks a sequential run may aim for */
-	uint8_t  e2fs_dir_prealloc;  /* ditto, for directories */
 };
 
 /* cluster summary information */

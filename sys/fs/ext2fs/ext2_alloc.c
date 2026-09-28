@@ -203,18 +203,15 @@ ext2_run_desired_length(struct inode *ip, uint32_t logical_length,
 	target = logical_length;
 	switch (alloc_class) {
 	case EXT2_ALLOC_DATA_SEQ:
-		/*
-		 * Ask for the filesystem's preallocation target on top of a
-		 * small request, so that a sequential stream of small writes
-		 * gets a run long enough to cluster.  s_prealloc_blocks is
-		 * 8 by default; ext2_alloc_max_run is the ceiling.
-		 */
-		if (target < (uint32_t)fs->e2fs_prealloc)
-			target = fs->e2fs_prealloc;
-		break;
 	case EXT2_ALLOC_DATA_RAND:
 	case EXT2_ALLOC_DIRECTORY:
-		/* No speculative space for non-sequential data or directories. */
+		/*
+		 * No speculative space.  A run is only ever as long as the
+		 * caller asked for; deciding otherwise is a guess about the
+		 * rest of the write, and guessing wrong costs fragmentation
+		 * that is hard to undo.  ext2_alloc_max_run is the ceiling for
+		 * callers that do want a longer run.
+		 */
 		break;
 	case EXT2_ALLOC_INDIR_METADATA:
 	case EXT2_ALLOC_EXTENT_METADATA:
