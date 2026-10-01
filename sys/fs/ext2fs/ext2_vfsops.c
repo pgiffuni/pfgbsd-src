@@ -968,6 +968,12 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	if (ronly == 0)
 		ext2_sbupdate(ump, MNT_WAIT);
 	/*
+	 * Create the dependency graph state.  This has to precede any
+	 * wrapped metadata write, including the recovery below.
+	 */
+	if (ronly == 0)
+		ext2_softdep_mount(ump, fs);
+	/*
 	 * Reclaim inodes that lost their last link before the system went
 	 * down.  This runs before the filesystem is visible, so that no
 	 * caller can observe an orphaned inode that recovery is about to
@@ -999,6 +1005,7 @@ out:
 	if (cp != NULL)
 		g_vfs_close_unlocked(cp);
 	if (ump) {
+		ext2_softdep_unmount(ump);
 		mtx_destroy(EXT2_MTX(ump));
 		free(ump->um_e2fs->e2fs_gd, M_EXT2MNT);
 		free(ump->um_e2fs->e2fs_contigdirs, M_EXT2MNT);
@@ -1046,6 +1053,8 @@ ext2_unmount(struct mount *mp, int mntflags)
 			    htole16(le16toh(fs->e2fs->e2fs_state) | E2FS_ISCLEAN);
 		ext2_sbupdate(ump, MNT_WAIT);
 	}
+
+	ext2_softdep_unmount(ump);
 
 	g_vfs_close_unlocked(ump->um_cp);
 	vrele(ump->um_devvp);
