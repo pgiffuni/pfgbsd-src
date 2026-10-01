@@ -1056,12 +1056,6 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 			neh->eh_ecount = htole16(le16toh(neh->eh_ecount) + m);
 		}
 
-ext2_extent_blk_csum_set(ip, bp->b_data);
-	bp->b_flags |= B_INVALONERR;
-	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
-	bp = NULL;
-	if (error)
-		goto cleanup;
 
 	/* Fix old index. */
 	if (m) {
