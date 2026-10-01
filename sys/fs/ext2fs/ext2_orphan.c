@@ -66,6 +66,7 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extattr.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 /*
  * Revision level from which ext2fs itself stopped maintaining an orphan
@@ -162,6 +163,7 @@ ext2_orphan_add(struct inode *ip)
 		return (EINVAL);
 	}
 
+	EXT2_CRASH(EXT2_CRASH_IN_ORPHAN_ADD);
 	EXT2_LOCK(ump);
 	ip->i_dtime = prev;
 	ip->i_flag |= IN_CHANGE;
@@ -180,7 +182,9 @@ ext2_orphan_add(struct inode *ip)
 	if (error)
 		return (error);
 
-	return (ext2_sbupdate(ump, MNT_WAIT));
+	error = ext2_sbupdate(ump, MNT_WAIT);
+	EXT2_CRASH(EXT2_CRASH_AFTER_ORPHAN_ADD);
+	return (error);
 }
 
 /*
@@ -334,6 +338,7 @@ ext2_orphan_release(struct inode *ip)
 	if (fs->e2fs_ronly || !ext2_orphan_supported(fs))
 		return (0);
 
+	EXT2_CRASH(EXT2_CRASH_IN_ORPHAN_TRUNC);
 	error = ext2_truncate(vp, 0, 0, NOCRED, curthread);
 	if (error)
 		return (error);
@@ -370,6 +375,7 @@ ext2_orphan_release(struct inode *ip)
 	 * normal case for an unlinked-but-never-orphaned inode.
 	 */
 	error = ext2_orphan_unlink(ip, next);
+	EXT2_CRASH(EXT2_CRASH_IN_ORPHAN_REMOVE);
 	if (error != 0 && error != ENOENT)
 		return (error);
 
@@ -380,6 +386,7 @@ ext2_orphan_release(struct inode *ip)
 		return (error);
 
 	ext2_vfree(vp, ip->i_number, mode);
+	EXT2_CRASH(EXT2_CRASH_AFTER_ORPHAN_REMOVE);
 	return (0);
 }
 

@@ -1532,7 +1532,9 @@ gotit:
 	e2fs_gd_set_nbfree(&fs->e2fs_gd[cg],
 	    e2fs_gd_get_nbfree(&fs->e2fs_gd[cg]) - 1);
 	fs->e2fs_fmod = 1;
+	EXT2_CRASH(EXT2_CRASH_AFTER_GROUP_COUNT);
 	EXT2_UNLOCK(ump);
+	EXT2_CRASH(EXT2_CRASH_AFTER_BITMAP_ALLOC);
 	ext2_gd_b_bitmap_csum_set(fs, cg, bp);
 	bdwrite(bp);
 	return (((uint64_t)cg) * fs->e2fs_bpg +
@@ -1863,8 +1865,10 @@ ext2_blkfree(struct inode *ip, e4fs_daddr_t bno, long size)
 	    e2fs_gd_get_nbfree(&fs->e2fs_gd[cg]) + 1);
 	fs->e2fs_fmod = 1;
 	EXT2_UNLOCK(ump);
+	EXT2_CRASH(EXT2_CRASH_BEFORE_BFREE);
 	ext2_gd_b_bitmap_csum_set(fs, cg, bp);
 	bdwrite(bp);
+	EXT2_CRASH(EXT2_CRASH_AFTER_BFREE);
 }
 
 /*
