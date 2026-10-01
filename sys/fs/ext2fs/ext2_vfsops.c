@@ -980,6 +980,17 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	MNT_ILOCK(mp);
 	mp->mnt_kern_flag |= MNTK_LOOKUP_SHARED | MNTK_EXTENDED_SHARED |
 	    MNTK_USES_BCACHE;
+	/*
+	 * Refuse "async".  ext2fs orders its metadata writes so that a
+	 * block is never returned to the allocator while a block map
+	 * still names it, but those guarantees are expressed as explicit
+	 * synchronous writes.  An async mount turns every one of them
+	 * into a delayed write, which does not merely lose recent
+	 * changes: a block can end up both referenced and free.
+	 * MNTK_NOASYNC is what ffs_softdep() sets for the same reason.
+	 */
+	mp->mnt_flag &= ~MNT_ASYNC;
+	mp->mnt_kern_flag |= MNTK_NOASYNC;
 	MNT_IUNLOCK(mp);
 	return (0);
 out:
