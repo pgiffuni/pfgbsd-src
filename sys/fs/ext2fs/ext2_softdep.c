@@ -37,7 +37,7 @@
 #include <sys/mutex.h>
 #include <sys/vnode.h>
 #include <sys/sysctl.h>
-#include <sys/atomic_san.h>
+#include <machine/atomic.h>
 
 #include <fs/ext2fs/fs.h>
 #include <fs/ext2fs/inode.h>
@@ -46,7 +46,10 @@
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_softdep.h>
 
-static const char *ext2_dep_typenames[] = EXT2_DEP_TYPES;
+static const char *ext2_dep_typenames[] = {
+	[EXT2_DEP_NEWBLK]	= "newblk",
+	[EXT2_DEP_METADATA]	= "metadata",
+};
 
 int ext2_softdep_created;
 int ext2_softdep_satisfied;
