@@ -46,6 +46,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extents.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -830,7 +831,7 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 			return (EIO);
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
-		error = bwrite(bp);
+		error = ext2_dep_bwrite(bp);
 		if (error) {
 			/*
 			 * bwrite() left the modified extent tree dirty in
@@ -1013,7 +1014,7 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 	}
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
-	error = bwrite(bp);
+	error = ext2_dep_bwrite(bp);
 	bp = NULL;
 	if (error)
 		goto cleanup;
@@ -1064,7 +1065,7 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 		}
 
 		ext2_extent_blk_csum_set(ip, bp->b_data);
-		error = bwrite(bp);
+		error = ext2_dep_bwrite(bp);
 		bp = NULL;
 		if (error)
 			goto cleanup;
@@ -1138,7 +1139,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 		neh->eh_max = htole16(ext4_ext_space_block(ip));
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
-	error = bwrite(bp);
+	error = ext2_dep_bwrite(bp);
 	if (error) {
 		ext2_rollback_unpublished(ip, newblk, 1);
 		goto out;
