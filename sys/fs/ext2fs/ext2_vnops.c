@@ -2002,6 +2002,7 @@ ext2_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 	/*
 	 * Make sure inode goes to disk before directory entry.
 	 */
+	EXT2_CRASH(EXT2_CRASH_AFTER_INODE_INIT);
 	error = ext2_update(tvp, !DOINGASYNC(tvp));
 	if (error)
 		goto bad;

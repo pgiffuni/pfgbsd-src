@@ -55,6 +55,53 @@
 #include <sys/types.h>
 
 /*
+ * Crash injection points, for the write-ordering tests.
+ *
+ * Each point stands for an interruption between two operations whose
+ * order the filesystem depends on.  A kernel built with
+ * EXT2FS_CRASH_TEST can be told to panic at a chosen point, which under
+ * a hypervisor snapshot is a stand-in for losing power: the device is
+ * left holding exactly the writes that completed.
+ *
+ * The points are placed so that each one is reachable only after the
+ * preceding writes have been issued, so a crash here leaves the
+ * filesystem in the state that ordering is supposed to survive.
+ *
+ * The panic is deliberate.  Continuing would let the operation finish and
+ * repair the inconsistency, which is the opposite of what is being
+ * tested.
+ */
+#ifdef EXT2FS_CRASH_TEST
+extern int ext2_crash_point;
+#define	EXT2_CRASH(n)	do {						\
+	if (ext2_crash_point == (n))					\
+		panic("ext2fs: injected crash at point %d", (n));	\
+} while (0)
+#else
+#define	EXT2_CRASH(n)	do { } while (0)
+#endif
+
+#define	EXT2_CRASH_AFTER_ALLOC		1	/* after physical allocation */
+#define	EXT2_CRASH_AFTER_BITMAP_ALLOC	2	/* after bitmap allocation */
+#define	EXT2_CRASH_AFTER_GROUP_COUNT	3	/* after group count update */
+#define	EXT2_CRASH_AFTER_INODE_INIT	4	/* after inode initialisation */
+#define	EXT2_CRASH_BEFORE_INDIR_WRITE	5	/* before indirect block write */
+#define	EXT2_CRASH_AFTER_INDIR_WRITE	6	/* after indirect block write */
+#define	EXT2_CRASH_BEFORE_PARENT	7	/* before parent pointer update */
+#define	EXT2_CRASH_AFTER_PARENT		8	/* after parent pointer update */
+#define	EXT2_CRASH_BEFORE_INODE_UPDATE	9	/* before inode write */
+#define	EXT2_CRASH_AFTER_INODE_UPDATE	10	/* after inode write */
+#define	EXT2_CRASH_BEFORE_DIRENTER	11	/* before directory insertion */
+#define	EXT2_CRASH_AFTER_DIRENTER	12	/* after directory insertion */
+#define	EXT2_CRASH_IN_ORPHAN_ADD	13	/* during orphan insertion */
+#define	EXT2_CRASH_AFTER_ORPHAN_ADD	14	/* after orphan insertion */
+#define	EXT2_CRASH_IN_ORPHAN_TRUNC	15	/* during orphan truncation */
+#define	EXT2_CRASH_BEFORE_BFREE		16	/* before block free */
+#define	EXT2_CRASH_AFTER_BFREE		17	/* after block free */
+#define	EXT2_CRASH_IN_ORPHAN_REMOVE	18	/* during orphan removal */
+#define	EXT2_CRASH_AFTER_ORPHAN_REMOVE	19	/* after orphan removal */
+
+/*
  * Dependency types.
  *
  * EXT2_DEP_NEWBLK	guards a freshly allocated metadata block that is not
