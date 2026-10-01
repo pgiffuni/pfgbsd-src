@@ -55,6 +55,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/fs.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_extattr.h>
 
 /*
@@ -173,9 +174,9 @@ ext2_indirtrunc(struct inode *ip, daddr_t lbn, daddr_t dbn,
 	if (last == -1)
 		bp->b_flags |= B_INVAL;
 	if (DOINGASYNC(vp)) {
-		bdwrite(bp);
+		ext2_dep_bdwrite(bp);
 	} else {
-		error = bwrite(bp);
+		error = ext2_dep_bwrite(bp);
 		if (error)
 			allerror = error;
 	}
