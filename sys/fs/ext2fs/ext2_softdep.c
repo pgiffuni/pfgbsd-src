@@ -97,20 +97,43 @@ ext2_softdep_unmount(struct ext2mount *ump)
 	struct m_ext2fs *fs = ump->um_e2fs;
 	struct ext2_softdep_mount *sd = fs->e2fs_softdep;
 	struct ext2_dep *dep;
+	int remaining;
 
 	if (sd == NULL)
 		return;
 
 	EXT2_SOFTDEP_LOCK(sd);
 	sd->sd_shutting_down = 1;
-	for (dep = STAILQ_FIRST(&sd->sd_all); dep != NULL;
-	    dep = STAILQ_NEXT(dep, dep_link)) {
-		printf("ext2fs: %s: dependency still pending at unmount, "
-		    "type %s, state %d\n", fs->e2fs_fsmnt,
-		    ext2_dep_typenames[dep->dep_type], dep->dep_state);
-		break;
+	remaining = STAILQ_FIRST(&sd->sd_all) != NULL;
+	if (remaining) {
+		for (dep = STAILQ_FIRST(&sd->sd_all); dep != NULL;
+		    dep = STAILQ_NEXT(dep, dep_link)) {
+			printf("ext2fs: %s: dependency %p (%s) still pending "
+			    "at unmount, state %d\n", fs->e2fs_fsmnt,
+			    (void *)dep,
+			    ext2_dep_typenames[dep->dep_type], dep->dep_state);
+		}
 	}
 	EXT2_SOFTDEP_UNLOCK(sd);
+
+	/*
+	 * A dependency that outlives the mount points at this state, and
+	 * a write that is still in flight calls back through b_iodone,
+	 * which takes sd_lock.  Freeing it here would leave that callback
+	 * locking a destroyed mutex over freed memory.
+	 *
+	 * Trying to write the outstanding buffers instead is not an option:
+	 * the reason one is outstanding is that it was invalidated rather
+	 * than written, and waiting on a buffer the cache has already
+	 * discarded is how an unmount hangs.
+	 *
+	 * So the state is deliberately leaked when anything remains.  It is
+	 * a few hundred bytes per mount, the leak is reported above, and a
+	 * later completion still satisfies the dependency properly and
+	 * frees it.  A use-after-free is not a trade worth making here.
+	 */
+	if (remaining)
+		return;
 
 	mtx_destroy(&sd->sd_lock);
 	free(sd, M_EXT2SOFTSDEP);
@@ -144,6 +167,17 @@ ext2_dep_create(struct inode *ip, struct buf *bp, uint8_t type)
 		return (NULL);
 	if (EXT2_BP_DEP(bp) != NULL)
 		return (NULL);
+
+	/*
+	 * Refuse once unmount has begun.  A dependency created then would
+	 * be attached to a mount state that is being torn down.
+	 */
+	EXT2_SOFTDEP_LOCK(sd);
+	if (sd->sd_shutting_down) {
+		EXT2_SOFTDEP_UNLOCK(sd);
+		return (NULL);
+	}
+	EXT2_SOFTDEP_UNLOCK(sd);
 
 	dep = malloc(sizeof(*dep), M_EXT2SOFTSDEP, M_WAITOK | M_ZERO);
 	if (dep == NULL)
