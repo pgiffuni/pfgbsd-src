@@ -96,8 +96,14 @@ ext2_update(struct vnode *vp, int waitfor)
 		brelse(bp);
 		return (error);
 	}
-	if (waitfor && !DOINGASYNC(vp))
-		return (bwrite(bp));
+	EXT2_CRASH(EXT2_CRASH_BEFORE_INODE_UPDATE);
+	if (waitfor && !DOINGASYNC(vp)) {
+		int error;
+
+		error = bwrite(bp);
+		EXT2_CRASH(EXT2_CRASH_AFTER_INODE_UPDATE);
+		return (error);
+	}
 	else {
 		bdwrite(bp);
 		return (0);

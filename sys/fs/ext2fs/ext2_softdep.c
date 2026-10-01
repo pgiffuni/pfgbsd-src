@@ -54,6 +54,9 @@ int ext2_softdep_cancelled;
 int ext2_softdep_outstanding;
 int ext2_softdep_debug;
 int ext2_softdep_async;
+#ifdef EXT2FS_CRASH_TEST
+int ext2_crash_point;
+#endif
 
 static void ext2_dep_free(struct ext2_dep *);
 static void ext2_dep_ref_locked(struct ext2_dep *);
