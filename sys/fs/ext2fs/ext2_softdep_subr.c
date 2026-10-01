@@ -41,6 +41,7 @@
 #include <sys/systm.h>
 #include <sys/mount.h>
 #include <sys/buf.h>
+#include <sys/bio.h>
 #include <sys/vnode.h>
 
 #include <fs/ext2fs/fs.h>
@@ -116,6 +117,131 @@ ext2_dep_bwrite(struct buf *bp)
 }
 
 /*
+ * Make everything a buffer depends on durable, without writing the buffer
+ * itself.
+ *
+ * Called from ext2_strategy(), which the VFS reaches for every buffer
+ * before its I/O starts.  That is the whole of the enforcement point: a
+ * buffer cannot reach the disk by any other route, so forcing the
+ * prerequisites here means a dependent can never land before them,
+ * however asynchronously the writes were queued.
+ *
+ * ffs_softdep() reaches the same moment through bioops.io_start.  That
+ * hook is one global vtable which only one filesystem may install, which
+ * is why it is not usable here; VOP_STRATEGY is per vnode, and ext2fs
+ * already owns it.
+ */
+static int
+ext2_dep_drive_depth(struct buf *bp, unsigned int depth)
+{
+	struct ext2_dep *dep, *pre;
+	int error;
+
+	if (depth >= EXT2_DEP_MAXDEPTH)
+		return (EIO);
+
+	dep = EXT2_BP_DEP(bp);
+	if (dep == NULL)
+		return (0);
+
+	pre = dep->dep_prereq;
+	if (pre == NULL || pre->dep_state != EXT2_DEP_PENDING)
+		return (0);
+	if (pre->dep_bp == NULL)
+		return (EIO);
+
+	error = ext2_dep_bwrite_depth(pre->dep_bp, depth + 1);
+	if (error)
+		return (error);
+
+	/*
+	 * Writing the prerequisite through the wrapper is what satisfies
+	 * it.  Still pending means the graph disagrees with itself, and the
+	 * dependent must not be allowed to proceed on that.
+	 */
+	if (pre->dep_state == EXT2_DEP_PENDING)
+		return (EIO);
+	return (0);
+}
+
+int
+ext2_dep_drive(struct buf *bp)
+{
+
+	if (bp == NULL)
+		return (0);
+	return (ext2_dep_drive_depth(bp, 0));
+}
+
+/*
+ * Completion hook for a write that was allowed to be deferred.
+ *
+ * Runs from the VFS once the buffer has actually reached the device,
+ * which is the only moment the dependency can honestly be called
+ * satisfied.  Satisfying it when the write was merely queued would be
+ * the failure this exists to prevent.
+ */
+static void
+ext2_dep_biodone(struct buf *bp)
+{
+	struct ext2_dep *dep;
+
+	dep = EXT2_BP_DEP(bp);
+	if (dep == NULL)
+		return;
+	/*
+	 * A write that failed put nothing on disk, so the dependency is
+	 * cancelled rather than satisfied.  Anything waiting on it drives
+	 * the prerequisite again and, failing that, refuses to proceed.
+	 */
+	if (bp->b_ioflags & BIO_ERROR)
+		ext2_dep_cancel(dep);
+	else
+		ext2_dep_satisfy(dep);
+}
+
+/*
+ * Queue a metadata write and let its dependency stand until the write
+ * completes.
+ *
+ * The dependent is kept off the disk by ext2_dep_drive() when it is
+ * flushed, so deferring the prerequisite is safe: nothing can name it
+ * before it lands.  What it buys is that the write happens on the flush
+ * path rather than on the caller's, which is where ffs_softdep() does it
+ * too.
+ *
+ * With the relaxation disabled this is exactly ext2_dep_bdwrite(), so
+ * turning the knob off restores the previous behaviour outright.
+ */
+void
+ext2_dep_defer(struct buf *bp)
+{
+	struct ext2_dep *dep;
+
+	KASSERT(bp != NULL, "ext2_dep_defer: NULL buffer");
+
+	dep = EXT2_BP_DEP(bp);
+	if (dep == NULL) {
+		bdwrite(bp);
+		return;
+	}
+	if (ext2_softdep_async == 0 || dep->dep_prereq != NULL ||
+	    dep->dep_state != EXT2_DEP_PENDING) {
+		ext2_dep_bdwrite(bp);
+		return;
+	}
+
+	/*
+	 * The dependency stays pending until b_iodone runs.  A buffer
+	 * invalidated before its write completes never calls it, and the
+	 * dependency is then reported as outstanding rather than silently
+	 * released.
+	 */
+	bp->b_iodone = ext2_dep_biodone;
+	bdwrite(bp);
+}
+
+/*
  * Write a buffer as a delayed write, honouring its dependencies.
  *
  * ext2fs makes every metadata write synchronous today, so a dependency
@@ -131,6 +257,18 @@ ext2_dep_bdwrite(struct buf *bp)
 
 	if (EXT2_BP_DEP(bp) == NULL) {
 		bdwrite(bp);
+		return;
+	}
+	/*
+	 * With the relaxation enabled this has to defer as well.  Writing
+	 * it synchronously here would drive the prerequisite out
+	 * immediately, which is safe but saves nothing: the caller would
+	 * still wait for both writes.  Deferring moves both onto the
+	 * flush path, where ext2_dep_drive() forces the prerequisite
+	 * first.
+	 */
+	if (ext2_softdep_async) {
+		ext2_dep_defer(bp);
 		return;
 	}
 	(void)ext2_dep_bwrite(bp);

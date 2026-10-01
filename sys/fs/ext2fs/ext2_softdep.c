@@ -53,6 +53,7 @@ int ext2_softdep_satisfied;
 int ext2_softdep_cancelled;
 int ext2_softdep_outstanding;
 int ext2_softdep_debug;
+int ext2_softdep_async;
 
 static void ext2_dep_free(struct ext2_dep *);
 static void ext2_dep_ref_locked(struct ext2_dep *);
