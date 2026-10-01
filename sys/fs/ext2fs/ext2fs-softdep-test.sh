@@ -48,6 +48,7 @@ while getopts "i:m:kbn" opt; do
 	esac
 done
 
+FORGE=${FORGE:-$(dirname "$0")/ext2fs-orphan-forge.sh}
 BLOCKSZ=4096
 FILES=${FILES:-200000}		# large enough to force indirect blocks
 DEEP=${DEEP:-50000}		# a deep file, to reach double/triple indirect
@@ -188,13 +189,19 @@ cd "$MNT" || exit 1
 # A corrupt chain must not hang or loop.  These are hand-built images; if
 # you do not have the tooling, they are skipped rather than silently
 # passed, because "did not crash" is the entire assertion.
-if [ -n "${CORRUPT_TOOL:-}" ]; then
-	"$CORRUPT_TOOL" cycle     "$IMG" && say "built a cyclic orphan chain"
-	"$CORRUPT_TOOL" selflink  "$IMG" && say "built a self-linked orphan"
-	"$CORRUPT_TOOL" outofrange "$IMG" && say "built an out-of-range orphan"
-	ok "corrupt chains built (see below for the hang test)"
+if [ -x "$FORGE" ]; then
+	for m in selflink cycle outofrange longchain badtype; do
+		# each mode needs its own copy: recovery mutates the chain
+		cp "$IMG" "$IMG.$m"
+		if "$FORGE" "$m" "$IMG.$m" >/dev/null 2>&1; then
+			ok "forged a $m orphan chain"
+		else
+			bad "could not forge a $m orphan chain"
+		fi
+	done
+	ok "corrupt chains built; recovery runs on the next mount"
 else
-	skip "corrupt chain tests (set CORRUPT_TOOL to a chain-forging helper)"
+	skip "corrupt chain tests (ext2fs-orphan-forge.sh not found)"
 fi
 
 ########################################################################
