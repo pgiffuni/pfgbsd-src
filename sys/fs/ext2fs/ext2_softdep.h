@@ -124,6 +124,39 @@ struct ext2_softdep_mount {
 };
 
 /*
+ * Layer boundaries, for a future journal.
+ *
+ * The filesystem is arranged so that a journal would have exactly one
+ * place to attach:
+ *
+ *	physical allocator	ext2_alloc.c	finds runs, frees blocks.
+ *				Registers no dependencies and knows nothing
+ *				about write ordering, so it would need no
+ *				change to journal their results.
+ *
+ *	mapping layer		ext2_balloc.c	installs pointers and extents,
+ *				ext2_extents.c	then states what must be ordered.
+ *
+ *	persistence layer	this file and ext2_softdep.c own the graph and
+ *				are the only thing a journal must replace or
+ *				complement.
+ *
+ *	buffer cache		the write wrappers here, and ext2_strategy(),
+ *				which forces a prerequisite before any I/O
+ *				starts.
+ *
+ * The operation boundary a journal would group is the VOP call:
+ * create, write, rename, unlink, truncate.  Each already runs entirely
+ * inside one call, so bracketing them needs no restructuring.
+ *
+ * Nothing here is journal-aware.  If a journal is added it records the
+ * same events these dependencies record -- allocation, free, metadata
+ * update -- and satisfies a dependency by committing rather than by
+ * observing a write complete.  That substitution is confined to
+ * ext2_dep_satisfy() and ext2_dep_cancel().
+ */
+
+/*
  * Counters are process-wide rather than per-mount so that they can be
  * read without walking the mount list; outstanding is the number of
  * dependency objects alive anywhere, and should settle back to zero.
