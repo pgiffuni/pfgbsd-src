@@ -597,8 +597,7 @@ ext2_inactive(struct vop_inactive_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct inode *ip = VTOI(vp);
-	struct thread *td = curthread;
-	int mode, error = 0;
+	int error = 0;
 
 	/*
 	 * Ignore inodes related to stale file handles.
@@ -606,13 +605,15 @@ ext2_inactive(struct vop_inactive_args *ap)
 	if (ip->i_mode == 0)
 		goto out;
 	if (ip->i_nlink <= 0) {
-		ext2_extattr_free(ip);
-		error = ext2_truncate(vp, (off_t)0, 0, NOCRED, td);
-		ip->i_rdev = 0;
-		mode = ip->i_mode;
-		ip->i_mode = 0;
-		ip->i_flag |= IN_CHANGE | IN_UPDATE;
-		ext2_vfree(vp, ip->i_number, mode);
+		/*
+		 * The last link is gone.  ext2_orphan_release() truncates,
+		 * writes the emptied inode, detaches it from the orphan list
+		 * if it is on one, and only then frees the inode number.
+		 * Going straight to ext2_vfree() would release a number
+		 * whose slot still describes the blocks just freed.
+		 */
+		error = ext2_orphan_release(ip);
+		goto out;
 	}
 	if (ip->i_flag & (IN_ACCESS | IN_CHANGE | IN_MODIFIED | IN_UPDATE))
 		ext2_update(vp, 0);

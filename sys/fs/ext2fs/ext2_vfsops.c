@@ -78,7 +78,6 @@ SDT_PROBE_DEFINE1(ext2fs, , vfsops, ext2_compute_sb_data_error, "char*");
 static int	ext2_flushfiles(struct mount *mp, int flags, struct thread *td);
 static int	ext2_mountfs(struct vnode *, struct mount *);
 static int	ext2_reload(struct mount *mp, struct thread *td);
-static int	ext2_sbupdate(struct ext2mount *, int);
 static int	ext2_cgupdate(struct ext2mount *, int);
 static vfs_unmount_t		ext2_unmount;
 static vfs_root_t		ext2_root;
@@ -969,6 +968,13 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	if (ronly == 0)
 		ext2_sbupdate(ump, MNT_WAIT);
 	/*
+	 * Reclaim inodes that lost their last link before the system went
+	 * down.  This runs before the filesystem is visible, so that no
+	 * caller can observe an orphaned inode that recovery is about to
+	 * remove.
+	 */
+	ext2_orphan_recovery(ump);
+	/*
 	 * Initialize filesystem stat information in mount struct.
 	 */
 	MNT_ILOCK(mp);
@@ -1016,6 +1022,14 @@ ext2_unmount(struct mount *mp, int mntflags)
 	fs = ump->um_e2fs;
 	ronly = fs->e2fs_ronly;
 	if (ronly == 0 && ext2_cgupdate(ump, MNT_WAIT) == 0) {
+		/*
+		 * Drain the orphan list before the filesystem is marked
+		 * clean.  Entries left behind would otherwise be reclaimed
+		 * only by a later mount, and marking a filesystem clean
+		 * with allocated, unreachable inodes still on its list is
+		 * exactly the claim an unclean shutdown denies.
+		 */
+		ext2_orphan_drain(ump, "unmount");
 		if (fs->e2fs_wasvalid)
 			fs->e2fs->e2fs_state =
 			    htole16(le16toh(fs->e2fs->e2fs_state) | E2FS_ISCLEAN);
@@ -1343,7 +1357,7 @@ ext2_fhtovp(struct mount *mp, struct fid *fhp, int flags, struct vnode **vpp)
 /*
  * Write a superblock and associated information back to disk.
  */
-static int
+int
 ext2_sbupdate(struct ext2mount *mp, int waitfor)
 {
 	struct m_ext2fs *fs = mp->um_e2fs;
