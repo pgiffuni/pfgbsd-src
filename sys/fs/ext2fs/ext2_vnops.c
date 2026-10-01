@@ -688,6 +688,7 @@ ext2_remove(struct vop_remove_args *ap)
 	if (error == 0) {
 		ip->i_nlink--;
 		ip->i_flag |= IN_CHANGE;
+		ext2_orphan_maybe_add(ip);
 	}
 out:
 	return (error);
@@ -752,6 +753,7 @@ ext2_dec_nlink(struct inode *ip)
 
 	if (!S_ISDIR(ip->i_mode) || ip->i_nlink > 2)
 		ip->i_nlink--;
+	ext2_orphan_maybe_add(ip);
 }
 
 /*
