@@ -674,6 +674,7 @@ ext2_extattr_block_delete(struct inode *ip, int attrnamespace, const char *name)
 	struct ext2fs_extattr_header *header;
 	struct ext2fs_extattr_entry *entry;
 	const char *attr_name;
+	uint64_t facl;
 	int name_len;
 	int error;
 
@@ -722,10 +723,16 @@ ext2_extattr_block_delete(struct inode *ip, int attrnamespace, const char *name)
 
 		if (strlen(name) == name_len &&
 		    0 == strncmp(attr_name, name, name_len)) {
+			/*
+			 * Stop naming the block, make that durable, and
+			 * only then return it to the allocator.
+			 */
+			facl = ip->i_facl;
 			ip->i_blocks -= btodb(fs->e2fs_bsize);
-			ext2_blkfree(ip, ip->i_facl, fs->e2fs_bsize);
 			ip->i_facl = 0;
 			error = ext2_update(ip->i_vnode, 1);
+			if (!error)
+				ext2_blkfree(ip, facl, fs->e2fs_bsize);
 
 			brelse(bp);
 			return (error);
@@ -1068,6 +1075,7 @@ ext2_extattr_block_set(struct inode *ip, int attrnamespace,
 	struct ext2fs_extattr_header *header;
 	struct ext2fs_extattr_entry *entry;
 	const char *attr_name;
+	uint64_t facl;
 	int name_len;
 	size_t size;
 	int error;
@@ -1172,16 +1180,21 @@ ext2_extattr_block_set(struct inode *ip, int attrnamespace,
 	ip->i_facl = ext2_alloc_meta(ip);
 	if (0 == ip->i_facl)
 		return (ENOSPC);
+	facl = ip->i_facl;
 
 	ip->i_blocks += btodb(fs->e2fs_bsize);
 	ext2_update(ip->i_vnode, 1);
 
-	bp = getblk(ip->i_devvp, fsbtodb(fs, ip->i_facl), fs->e2fs_bsize, 0, 0, 0);
+	bp = getblk(ip->i_devvp, fsbtodb(fs, facl), fs->e2fs_bsize, 0, 0, 0);
 	if (!bp) {
-		ext2_blkfree(ip, ip->i_facl, fs->e2fs_bsize);
+		/*
+		 * The inode already names this block on disk, so it has to
+		 * stop naming it durably before the block is released.
+		 */
 		ip->i_blocks -= btodb(fs->e2fs_bsize);
 		ip->i_facl = 0;
 		ext2_update(ip->i_vnode, 1);
+		ext2_blkfree(ip, facl, fs->e2fs_bsize);
 		return (EIO);
 	}
 
@@ -1215,6 +1228,7 @@ int ext2_extattr_free(struct inode *ip)
 	struct m_ext2fs *fs;
 	struct buf *bp;
 	struct ext2fs_extattr_header *header;
+	uint64_t facl;
 	int error;
 
 	fs = ip->i_e2fs;
@@ -1243,17 +1257,30 @@ int ext2_extattr_free(struct inode *ip)
 		return (error);
 	}
 
+	/* Capture before i_facl is cleared below. */
+	facl = ip->i_facl;
+
 	if (le32toh(header->h_refcount) > 1) {
 		header->h_refcount = htole32(le32toh(header->h_refcount) - 1);
 		bwrite(bp);
-	} else {
-		ext2_blkfree(ip, ip->i_facl, ip->i_e2fs->e2fs_bsize);
-		brelse(bp);
+		ip->i_blocks -= btodb(fs->e2fs_bsize);
+		ip->i_facl = 0;
+		ext2_update(ip->i_vnode, 1);
+		return (0);
 	}
 
-	ip->i_blocks -= btodb(ip->i_e2fs->e2fs_bsize);
+	/*
+	 * Last reference.  The inode has to stop naming the block before
+	 * the bitmap offers it again: a crash in between would leave the
+	 * block both referenced by i_facl and marked free.
+	 */
+	ip->i_blocks -= btodb(fs->e2fs_bsize);
 	ip->i_facl = 0;
-	ext2_update(ip->i_vnode, 1);
+	error = ext2_update(ip->i_vnode, 1);
+	brelse(bp);
+	if (error)
+		return (error);
 
+	ext2_blkfree(ip, facl, fs->e2fs_bsize);
 	return (0);
 }
