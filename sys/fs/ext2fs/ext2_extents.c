@@ -46,6 +46,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extents.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -831,7 +832,7 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
 		bp->b_flags |= B_INVALONERR;
-		error = bwrite(bp);
+		error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 		if (error) {
 			return (error);
 		}
@@ -1005,7 +1006,7 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
 	bp->b_flags |= B_INVALONERR;
-	error = bwrite(bp);
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	bp = NULL;
 	if (error)
 		goto cleanup;
@@ -1057,11 +1058,10 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 
 ext2_extent_blk_csum_set(ip, bp->b_data);
 	bp->b_flags |= B_INVALONERR;
-	error = bwrite(bp);
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	bp = NULL;
-	if (error) {
+	if (error)
 		goto cleanup;
-	}
 
 	/* Fix old index. */
 	if (m) {
@@ -1133,7 +1133,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
 	bp->b_flags |= B_INVALONERR;
-	error = bwrite(bp);
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	if (error) {
 		ext2_rollback_unpublished(ip, newblk, 1);
 		bp = NULL;
