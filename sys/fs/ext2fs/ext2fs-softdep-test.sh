@@ -14,9 +14,12 @@
 #   5. per-class deferred-write runs, one bit at a time
 #   6. benchmarks, only if asked for
 #
-# The crash matrix needs a kernel built with EXT2FS_CRASH_TEST and a
-# hypervisor that can snapshot the disk image, because a panic is the
-# power-loss stand-in.  Everything else runs on a stock kernel.
+# The crash matrix needs a hypervisor that can snapshot the disk image,
+# because the injected panic is the power-loss stand-in.  It needs
+# nothing special from the kernel: the injection points are compiled in
+# and stay inert until vfs.ext2fs_softdep.crash_enable is set, so the
+# same kernel runs the whole suite.  Everything else needs no
+# hypervisor either.
 #
 # Usage:  ./ext2fs-softdep-test.sh [-i image] [-m mountpoint] [-k]
 #           -i  disk image to create and test against (default /tmp/ext2.img)
@@ -233,11 +236,17 @@ else
 		say "point $pt"
 		"${SNAPSHOT_TOOL:-echo}" snapshot "$IMG" "$IMG.snap" 2>/dev/null ||
 			{ skip "point $pt (no snapshot tool)"; continue; }
-		sds crash_point "$pt" || { skip "point $pt (no crash_point sysctl)"; break; }
+		if ! sds crash_point "$pt"; then
+			skip "point $pt (no crash_point sysctl)"
+			break
+		fi
+		# the panic only fires once injection itself is armed
+		sds crash_enable 1
 		( cd "$MNT" && timeout 120 ./ext2fs-crashworkload.sh ) >/dev/null 2>&1
 		# the kernel has panicked; the image is now in whatever state it
 		# managed to write
 		"${SNAPSHOT_TOOL:-echo}" restore "$IMG.snap" "$IMG"
+		sds crash_enable 0 2>/dev/null
 		sds crash_point 0 2>/dev/null
 		if ! mount -t ext2 "$IMG" "$MNT"; then
 			bad "point $pt: filesystem did not mount"
