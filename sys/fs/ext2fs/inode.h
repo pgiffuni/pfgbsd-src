@@ -75,6 +75,7 @@ struct inode {
 	struct	ext2mount *i_ump;
 	uint32_t i_flag;	/* flags, see below */
 	ino_t	  i_number;	/* The identity of the inode. */
+	uint32_t  i_dtime;	/* Orphan list: previous head, or 0. */
 
 	struct	m_ext2fs *i_e2fs;	/* EXT2FS */
 	u_quad_t i_modrev;	/* Revision level for NFS lease. */

@@ -354,6 +354,17 @@ int	ext2_truncate(struct vnode *, off_t, int, struct ucred *, struct thread *);
 int	ext2_update(struct vnode *, int);
 int	ext2_valloc(struct vnode *, int, struct ucred *, struct vnode **);
 int	ext2_vfree(struct vnode *, ino_t, int);
+/*
+ * Orphan list.  An inode that loses its last link while still open stays
+ * allocated; these record it so that a crash leaves something recoverable
+ * without scanning the inode table.
+ */
+int	ext2_sbupdate(struct ext2mount *, int);
+int	ext2_orphan_add(struct inode *);
+void	ext2_orphan_maybe_add(struct inode *);
+int	ext2_orphan_release(struct inode *);
+void	ext2_orphan_drain(struct ext2mount *, const char *);
+void	ext2_orphan_recovery(struct ext2mount *);
 int	ext2_vinit(struct mount *, struct vop_vector *, struct vnode **vpp);
 int	ext2_lookup(struct vop_cachedlookup_args *);
 int	ext2_readdir(struct vop_readdir_args *);
