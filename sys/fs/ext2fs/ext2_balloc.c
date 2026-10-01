@@ -273,7 +273,17 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		ndep = ext2_dep_create(ip, nbp, EXT2_DEP_NEWBLK);
 		if (pdep != NULL && ndep != NULL)
 			ext2_dep_link(pdep, ndep);
-		if ((error = ext2_dep_bwrite(nbp)) != 0) {
+		/*
+		 * With the relaxation enabled the new block goes out on the
+		 * flush path and its dependency stands until it lands; the
+		 * parent is held off the disk until then by
+		 * ext2_dep_drive().  Otherwise the new block is written
+		 * here, as before.
+		 */
+		if (ext2_softdep_async) {
+			ext2_dep_defer(nbp);
+			error = 0;
+		} else if ((error = ext2_dep_bwrite(nbp)) != 0) {
 			/* bwrite() released nbp; pref is still unreferenced. */
 			ext2_dep_discard(bp);
 			ext2_rollback_unpublished(ip, pref, 1);

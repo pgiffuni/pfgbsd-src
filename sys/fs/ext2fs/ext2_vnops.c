@@ -84,6 +84,7 @@
 #include <fs/ext2fs/ext2_acl.h>
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_dir.h>
 #include <fs/ext2fs/ext2_mount.h>
@@ -1575,6 +1576,18 @@ ext2_strategy(struct vop_strategy_args *ap)
 
 	if (VN_ISDEV(vp))
 		panic("ext2_strategy: spec");
+
+	/*
+	 * Everything this buffer depends on has to be durable before its
+	 * own I/O starts.  The VFS reaches this routine for every buffer
+	 * on the way out, so this is the point at which the ordering is
+	 * enforced rather than assumed.
+	 */
+	if (ext2_dep_drive(bp) != 0) {
+		bp->b_error = EIO;
+		return (EIO);
+	}
+
 	if (bp->b_blkno == bp->b_lblkno) {
 		if (VTOI(ap->a_vp)->i_flag & IN_E4EXTENTS)
 			error = ext4_bmapext(vp, bp->b_lblkno, &blkno, NULL, NULL);
