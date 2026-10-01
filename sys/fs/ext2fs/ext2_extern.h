@@ -360,6 +360,8 @@ int	ext2_vfree(struct vnode *, ino_t, int);
  * without scanning the inode table.
  */
 int	ext2_sbupdate(struct ext2mount *, int);
+int	ext2_softdep_mount(struct ext2mount *, struct m_ext2fs *);
+void	ext2_softdep_unmount(struct ext2mount *);
 int	ext2_orphan_add(struct inode *);
 void	ext2_orphan_maybe_add(struct inode *);
 int	ext2_orphan_release(struct inode *);

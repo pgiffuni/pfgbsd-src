@@ -51,6 +51,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_mount.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
@@ -115,6 +116,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 	struct vnode *vp = ITOV(ip);
 	struct indir indirs[EXT2_NIADDR + 2];
 	struct ext2_alloc_context ctx;
+	struct ext2_dep *pdep, *ndep;
 	e2fs_daddr_t *bap;
 	e4fs_daddr_t bpref, pref, newb;
 	int num, i, error;
@@ -215,7 +217,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * Write synchronously so that indirect blocks
 		 * never point at garbage.
 		 */
-		if ((error = bwrite(bp)) != 0) {
+		if ((error = ext2_dep_bwrite(bp)) != 0) {
 			/* bwrite() released bp; pref is still unreferenced. */
 			ext2_rollback_unpublished(ip, pref, 1);
 			return (error);
@@ -261,11 +263,19 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		nbp->b_blkno = fsbtodb(fs, pref);
 		vfs_bio_clrbuf(nbp);
 		/*
-		 * Write synchronously so that indirect blocks
-		 * never point at garbage.
+		 * The new block must reach the disk before the parent names
+		 * it.  Record that as a dependency rather than relying on
+		 * the code below happening to keep the order, so that the
+		 * ordering is stated where it can be checked and survives
+		 * the writes being relaxed later.
 		 */
-		if ((error = bwrite(nbp)) != 0) {
+		pdep = ext2_dep_create(ip, bp, EXT2_DEP_METADATA);
+		ndep = ext2_dep_create(ip, nbp, EXT2_DEP_NEWBLK);
+		if (pdep != NULL && ndep != NULL)
+			ext2_dep_link(pdep, ndep);
+		if ((error = ext2_dep_bwrite(nbp)) != 0) {
 			/* bwrite() released nbp; pref is still unreferenced. */
+			ext2_dep_discard(bp);
 			ext2_rollback_unpublished(ip, pref, 1);
 			brelse(bp);
 			return (error);
@@ -278,7 +288,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * at the top of the next iteration.
 		 */
 		if (flags & IO_SYNC) {
-			if ((error = bwrite(bp)) != 0) {
+			if ((error = ext2_dep_bwrite(bp)) != 0) {
 				/*
 				 * The child indirect block is on disk but
 				 * unreachable: the parent that names it is not.
@@ -290,7 +300,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		} else {
 			if (bp->b_bufsize == fs->e2fs_bsize)
 				bp->b_flags |= B_CLUSTEROK;
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 			bp = NULL;
 		}
 	}
@@ -340,7 +350,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * delayed write.
 		 */
 		if (flags & IO_SYNC) {
-			if ((error = bwrite(bp)) != 0) {
+			if ((error = ext2_dep_bwrite(bp)) != 0) {
 				/*
 				 * The parent indirect block did not reach
 				 * the disk, so the run is still unpublished
@@ -354,7 +364,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		} else {
 			if (bp->b_bufsize == fs->e2fs_bsize)
 				bp->b_flags |= B_CLUSTEROK;
-			bdwrite(bp);
+			ext2_dep_bdwrite(bp);
 		}
 		*bpp = nbp;
 		return (0);
