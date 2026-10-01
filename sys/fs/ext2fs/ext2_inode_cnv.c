@@ -161,9 +161,17 @@ ext2_ei2i(struct ext2fs_dinode *ei, struct inode *ip)
 	 * unused - according to ext2 standards. Ufs marks this fact by
 	 * setting i_mode to zero - why ? I can see that this might lead to
 	 * problems in an undelete.
+	 *
+	 * An inode on the orphan list is the exception: it has no links
+	 * but is still allocated and still has blocks, and it has to be
+	 * readable so that it can be truncated and released.  Reporting
+	 * its mode as zero would leave vnode initialisation with nothing
+	 * to work from.
 	 */
 	ip->i_nlink = le16toh(ei->e2di_nlink);
-	ip->i_mode = ip->i_nlink ? le16toh(ei->e2di_mode) : 0;
+	ip->i_dtime = le32toh(ei->e2di_dtime);
+	ip->i_mode = (ip->i_nlink == 0 && ip->i_dtime == 0) ? 0 :
+	    le16toh(ei->e2di_mode);
 	if (ip->i_number == EXT2_ROOTINO &&
 	    (ip->i_nlink < 2 || !S_ISDIR(ip->i_mode))) {
 		SDT_PROBE2(ext2fs, , trace, inode_cnv, 1, "root inode invalid");
@@ -266,11 +274,12 @@ ext2_i2ei(struct inode *ip, struct ext2fs_dinode *ei)
 	ei->e2di_mtime = htole32(ip->i_mtime);
 	ei->e2di_ctime = htole32(ip->i_ctime);
 	/*
-	 * Godmar thinks: if dtime is nonzero, ext2 says this inode has been
-	 * deleted, this would correspond to a zero link count
+	 * ext2 stores the orphan chain linkage here: a nonzero value means
+	 * this inode is on the orphan list, and holds the previous head.
+	 * It must round-trip unchanged, since deriving it from the link
+	 * count would overwrite the linkage on every inode write.
 	 */
-	ei->e2di_dtime = htole32(le16toh(ei->e2di_nlink) ? 0 :
-	    le32toh(ei->e2di_mtime));
+	ei->e2di_dtime = htole32(ip->i_dtime);
 	if (E2DI_HAS_XTIME(ip)) {
 		ei->e2di_ctime_extra = ext2_encode_extra_time(ip->i_ctime,
 		    ip->i_ctimensec);
