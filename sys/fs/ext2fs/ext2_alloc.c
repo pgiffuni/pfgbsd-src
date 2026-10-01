@@ -559,11 +559,6 @@ ext2_abort_allocated_runs(struct inode *ip, struct ext2_alloc_run *runp)
 static SYSCTL_NODE(_vfs, OID_AUTO, ext2fs, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "EXT2FS filesystem");
 
-static int doasyncfree = 1;
-
-SYSCTL_INT(_vfs_ext2fs, OID_AUTO, doasyncfree, CTLFLAG_RW, &doasyncfree, 0,
-    "Use asynchronous writes to update block pointers when freeing blocks");
-
 /*
  * Gate for VOP_REALLOCBLKS.  Shared with ext4_reallocblks() so that the
  * tuning knob covers extent-mapped files as well.
@@ -731,34 +726,24 @@ ext2_reallocblks(struct vop_reallocblks_args *ap)
 	}
 	/*
 	 * Next we must write out the modified inode and indirect blocks.
-	 * For strict correctness, the writes should be synchronous since
-	 * the old block values may have been written to disk. In practise
-	 * they are almost never written, but if we are concerned about
-	 * strict correctness, the `doasyncfree' flag should be set to zero.
+	 * The old code chose between bdwrite() and bwrite() here, under a
+	 * doasyncfree knob, and left the ordering problem to a "has this
+	 * been written" flag that does not exist.  Such a flag is what a
+	 * dependency mechanism would supply.
 	 *
-	 * The test on `doasyncfree' should be changed to test a flag
-	 * that shows whether the associated buffers and inodes have
-	 * been written. The flag should be set when the cluster is
-	 * started and cleared whenever the buffer or inode is flushed.
-	 * We can then check below to see if it is set, and do the
-	 * synchronous write only when it has been cleared.
+	 * Until then these writes must complete before the old blocks are
+	 * freed below.  Releasing a block whose old mapping is still only
+	 * in a delayed-write buffer would let a crash leave the on-disk
+	 * block map naming a block the bitmap already offers for reuse.
 	 */
 	if (sbap != &ip->i_db[0]) {
-		if (doasyncfree)
-			bdwrite(sbp);
-		else
-			bwrite(sbp);
+		bwrite(sbp);
 	} else {
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
-		if (!doasyncfree)
-			ext2_update(vp, 1);
+		ext2_update(vp, 1);
 	}
-	if (ssize < len) {
-		if (doasyncfree)
-			bdwrite(ebp);
-		else
-			bwrite(ebp);
-	}
+	if (ssize < len)
+		bwrite(ebp);
 	/*
 	 * Last, free the old blocks and assign the new blocks to the buffers.
 	 */
