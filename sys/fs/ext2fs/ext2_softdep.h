@@ -109,12 +109,6 @@ extern int ext2_crash_enabled;
  * EXT2_DEP_METADATA	guards a metadata update that must not be written
  *			before the prerequisites linked to it.
  */
-#define	EXT2_DEP_TYPES {						\
-	{ "newblk",	EXT2_DEP_NEWBLK },				\
-	{ "metadata",	EXT2_DEP_METADATA },				\
-	{ NULL,		0 }						\
-}
-
 enum {
 	EXT2_DEP_NEWBLK = 1,
 	EXT2_DEP_METADATA
