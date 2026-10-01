@@ -49,6 +49,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/fs.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_dir.h>
 #include <fs/ext2fs/htree.h>
@@ -450,10 +451,16 @@ ext2_htree_writebuf(struct inode* ip, struct ext2fs_htree_lookup_info *info)
 {
 	int i, error;
 
-	for (i = 0; i < info->h_levels_num; i++) {
+	/*
+	 * Deepest level first.  Level 0 is the index root and every level
+	 * below it is named by the one above, so writing in ascending
+	 * order would let a crash leave the root on disk pointing at a
+	 * node that was never written.
+	 */
+	for (i = info->h_levels_num; i-- > 0; ) {
 		struct buf *bp = info->h_levels[i].h_bp;
 		ext2_dx_csum_set(ip, (struct ext2fs_direct_2 *)bp->b_data);
-		error = bwrite(bp);
+		error = ext2_dep_bwrite(bp);
 		if (error)
 			return (error);
 	}
@@ -731,32 +738,35 @@ ext2_htree_create_index(struct vnode *vp, struct componentname *cnp,
 	ext2_htree_insert_entry(&info, split_hash, 2);
 
 	/*
-	 * Write directory block 0.
-	 */
-	ext2_dx_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
-	if (DOINGASYNC(vp)) {
-		bdwrite(bp);
-		error = 0;
-	} else {
-		error = bwrite(bp);
-	}
-	dp->i_flag |= IN_CHANGE | IN_UPDATE;
-	if (error)
-		goto out;
-
-	/*
-	 * Write directory block 1.
+	 * Write directory blocks 1 and 2 before the index root that
+	 * names them.  The root was built naming blocks 1 and 2, so
+	 * writing it first would leave a crash with the directory
+	 * pointing at a block that was never initialised.  Losing them
+	 * the other way round costs two unreachable blocks, which is
+	 * the cheaper failure.
 	 */
 	ext2_dirent_csum_set(dp, (struct ext2fs_direct_2 *)buf1);
 	error = ext2_htree_append_block(vp, buf1, cnp, blksize);
 	if (error)
-		goto out1;
+		goto out;
 
-	/*
-	 * Write directory block 2.
-	 */
 	ext2_dirent_csum_set(dp, (struct ext2fs_direct_2 *)buf2);
 	error = ext2_htree_append_block(vp, buf2, cnp, blksize);
+	if (error)
+		goto out;
+
+	/*
+	 * Write directory block 0, the index root.
+	 */
+	ext2_dx_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
+	if (DOINGASYNC(vp)) {
+		ext2_dep_bdwrite(bp);
+		error = 0;
+	} else {
+		error = ext2_dep_bwrite(bp);
+	}
+	bp = NULL;
+	dp->i_flag |= IN_CHANGE | IN_UPDATE;
 
 	free(buf1, M_TEMP);
 	free(buf2, M_TEMP);
@@ -764,7 +774,6 @@ ext2_htree_create_index(struct vnode *vp, struct componentname *cnp,
 out:
 	if (bp != NULL)
 		brelse(bp);
-out1:
 	free(buf1, M_TEMP);
 	free(buf2, M_TEMP);
 	return (error);
@@ -878,7 +887,7 @@ ext2_htree_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry,
 			/* Write new index node to disk */
 			ext2_dx_csum_set(ip,
 			    (struct ext2fs_direct_2 *)dst_bp->b_data);
-			error = bwrite(dst_bp);
+			error = ext2_dep_bwrite(dst_bp);
 			ip->i_flag |= IN_CHANGE | IN_UPDATE;
 			if (error)
 				goto finish;
@@ -934,7 +943,7 @@ ext2_htree_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry,
 
 	/* Write the target directory block */
 	ext2_dirent_csum_set(ip, (struct ext2fs_direct_2 *)bp->b_data);
-	error = bwrite(bp);
+	error = ext2_dep_bwrite(bp);
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
 	if (error)
 		goto finish;
