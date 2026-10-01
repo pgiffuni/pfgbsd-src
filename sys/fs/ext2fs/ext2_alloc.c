@@ -52,6 +52,7 @@
 #include <fs/ext2fs/ext2_mount.h>
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DEFINE(ext2fs);
 /*
@@ -737,13 +738,13 @@ ext2_reallocblks(struct vop_reallocblks_args *ap)
 	 * block map naming a block the bitmap already offers for reuse.
 	 */
 	if (sbap != &ip->i_db[0]) {
-		bwrite(sbp);
+		ext2_dep_write(sbp, EXT2_SD_ASYNC_NEWBLK);
 	} else {
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
 		ext2_update(vp, 1);
 	}
 	if (ssize < len)
-		bwrite(ebp);
+		ext2_dep_write(ebp, EXT2_SD_ASYNC_NEWBLK);
 	/*
 	 * Last, free the old blocks and assign the new blocks to the buffers.
 	 */
