@@ -1600,17 +1600,15 @@ ext4_ext_header(struct inode *ip)
 }
 
 static int
-ext4_remove_blocks(struct inode *ip, struct ext4_extent *ex,
-    unsigned long from, unsigned long to)
+ext4_remove_blocks(struct inode *ip, e4fs_daddr_t pblk, unsigned long lblk,
+    unsigned long len, unsigned long from, unsigned long to)
 {
 	unsigned long num, start;
 
-	if (from >= le32toh(ex->e_blk) &&
-	    to == le32toh(ex->e_blk) + ext4_ext_get_actual_len(ex) - 1) {
+	if (from >= lblk && to == lblk + len - 1) {
 		/* Tail cleanup. */
-		num = le32toh(ex->e_blk) + ext4_ext_get_actual_len(ex) - from;
-		start = ext4_ext_extent_pblock(ex) +
-		    ext4_ext_get_actual_len(ex) - num;
+		num = lblk + len - from;
+		start = pblk + len - num;
 		ext4_ext_blkfree(ip, start, num, 0);
 	}
 
@@ -1643,6 +1641,8 @@ ext4_ext_rm_leaf(struct inode *ip, struct ext4_extent_path *path,
 	struct ext4_extent *ex;
 	unsigned int a, b, block, num;
 	unsigned long ex_blk;
+	unsigned long flen;
+	e4fs_daddr_t fpblk;
 	unsigned short ex_len;
 	int depth;
 	int error, correct_index;
@@ -1692,9 +1692,16 @@ ext4_ext_rm_leaf(struct inode *ip, struct ext4_extent_path *path,
 		if (ex == EXT_FIRST_EXTENT(eh))
 			correct_index = 1;
 
-		error = ext4_remove_blocks(ip, ex, a, b);
-		if (error)
-			goto out;
+		/*
+		 * Remember the physical range covered by the extent
+		 * before it is modified, and release those blocks only
+		 * after the shrunken extent has reached the disk.
+		 * Freeing first would let a crash leave the on-disk
+		 * leaf still naming blocks that the bitmap already
+		 * offers for reuse.
+		 */
+		fpblk = ext4_ext_extent_pblock(ex);
+		flen = ext4_ext_get_actual_len(ex);
 
 		if (num == 0) {
 			ext4_ext_store_pblock(ex, 0);
@@ -1705,6 +1712,10 @@ ext4_ext_rm_leaf(struct inode *ip, struct ext4_extent_path *path,
 		ex->e_len = htole16(num);
 
 		error = ext4_ext_dirty(ip, path + depth);
+		if (error)
+			goto out;
+
+		error = ext4_remove_blocks(ip, fpblk, ex_blk, flen, a, b);
 		if (error)
 			goto out;
 
