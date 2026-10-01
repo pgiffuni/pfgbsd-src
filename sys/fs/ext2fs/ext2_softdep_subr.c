@@ -181,7 +181,7 @@ ext2_dep_drive(struct buf *bp)
  * satisfied.  Satisfying it when the write was merely queued would be
  * the failure this exists to prevent.
  */
-static void
+void
 ext2_dep_biodone(struct buf *bp)
 {
 	struct ext2_dep *dep;
@@ -214,7 +214,7 @@ ext2_dep_biodone(struct buf *bp)
  * turning the knob off restores the previous behaviour outright.
  */
 void
-ext2_dep_defer(struct buf *bp)
+ext2_dep_defer(struct buf *bp, int class)
 {
 	struct ext2_dep *dep;
 
@@ -225,7 +225,7 @@ ext2_dep_defer(struct buf *bp)
 		bdwrite(bp);
 		return;
 	}
-	if (ext2_softdep_async == 0 || dep->dep_prereq != NULL ||
+	if ((ext2_softdep_async & class) == 0 || dep->dep_prereq != NULL ||
 	    dep->dep_state != EXT2_DEP_PENDING) {
 		ext2_dep_bdwrite(bp);
 		return;
@@ -239,6 +239,32 @@ ext2_dep_defer(struct buf *bp)
 	 */
 	bp->b_iodone = ext2_dep_biodone;
 	bdwrite(bp);
+}
+
+/*
+ * Write a buffer, deferring it when its class is enabled.
+ *
+ * Same contract as ext2_dep_bwrite(): the buffer reaches the disk, the
+ * prerequisites first.  The difference is only whether the caller waits
+ * here or on the flush path.
+ */
+int
+ext2_dep_write(struct buf *bp, int class)
+{
+	struct ext2_dep *dep;
+
+	KASSERT(bp != NULL, "ext2_dep_write: NULL buffer");
+
+	dep = EXT2_BP_DEP(bp);
+	if (dep == NULL)
+		return (bwrite(bp));
+	if ((ext2_softdep_async & class) == 0 || dep->dep_prereq != NULL ||
+	    dep->dep_state != EXT2_DEP_PENDING)
+		return (ext2_dep_bwrite(bp));
+
+	bp->b_iodone = ext2_dep_biodone;
+	bdwrite(bp);
+	return (0);
 }
 
 /*
@@ -267,10 +293,6 @@ ext2_dep_bdwrite(struct buf *bp)
 	 * flush path, where ext2_dep_drive() forces the prerequisite
 	 * first.
 	 */
-	if (ext2_softdep_async) {
-		ext2_dep_defer(bp);
-		return;
-	}
 	(void)ext2_dep_bwrite(bp);
 }
 
