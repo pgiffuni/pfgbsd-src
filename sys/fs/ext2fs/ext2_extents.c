@@ -831,7 +831,7 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 			return (EIO);
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
-		error = ext2_dep_bwrite(bp);
+		error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 		if (error) {
 			/*
 			 * bwrite() left the modified extent tree dirty in
@@ -1014,7 +1014,7 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 	}
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
-	error = ext2_dep_bwrite(bp);
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	bp = NULL;
 	if (error)
 		goto cleanup;
@@ -1065,7 +1065,7 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 		}
 
 		ext2_extent_blk_csum_set(ip, bp->b_data);
-		error = ext2_dep_bwrite(bp);
+		error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 		bp = NULL;
 		if (error)
 			goto cleanup;
@@ -1139,7 +1139,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 		neh->eh_max = htole16(ext4_ext_space_block(ip));
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
-	error = ext2_dep_bwrite(bp);
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	if (error) {
 		ext2_rollback_unpublished(ip, newblk, 1);
 		goto out;

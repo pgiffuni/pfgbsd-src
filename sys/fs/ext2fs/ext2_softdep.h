@@ -135,6 +135,16 @@ extern int ext2_softdep_outstanding;
 extern int ext2_softdep_debug;
 extern int ext2_softdep_async;
 
+/*
+ * Which classes of metadata write may be deferred rather than written
+ * synchronously.  A bitmask so that one class can be enabled, measured
+ * and reverted without touching the others; enabling several at once
+ * hides which one regressed.
+ */
+#define	EXT2_SD_ASYNC_NEWBLK	0x01	/* new indirect block */
+#define	EXT2_SD_ASYNC_EXTENT	0x02	/* extent tree metadata */
+#define	EXT2_SD_ASYNC_DIR	0x04	/* directory metadata */
+
 #define	EXT2_SOFTDEP_LOCK(sd)		mtx_lock(&(sd)->sd_lock)
 #define	EXT2_SOFTDEP_UNLOCK(sd)		mtx_unlock(&(sd)->sd_lock)
 
@@ -155,7 +165,9 @@ int	ext2_dep_link(struct ext2_dep *, struct ext2_dep *);
 void	ext2_dep_satisfy(struct ext2_dep *);
 void	ext2_dep_cancel(struct ext2_dep *);
 void	ext2_dep_discard(struct buf *);
-void	ext2_dep_defer(struct buf *);
+void	ext2_dep_biodone(struct buf *);
+void	ext2_dep_defer(struct buf *, int);
+int	ext2_dep_write(struct buf *, int);
 int	ext2_dep_drive(struct buf *);
 
 int	ext2_dep_bwrite(struct buf *);

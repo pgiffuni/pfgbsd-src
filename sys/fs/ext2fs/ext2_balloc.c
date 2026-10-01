@@ -280,8 +280,8 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * ext2_dep_drive().  Otherwise the new block is written
 		 * here, as before.
 		 */
-		if (ext2_softdep_async) {
-			ext2_dep_defer(nbp);
+		if (ext2_softdep_async & EXT2_SD_ASYNC_NEWBLK) {
+			ext2_dep_defer(nbp, EXT2_SD_ASYNC_NEWBLK);
 			error = 0;
 		} else if ((error = ext2_dep_bwrite(nbp)) != 0) {
 			/* bwrite() released nbp; pref is still unreferenced. */
@@ -310,7 +310,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		} else {
 			if (bp->b_bufsize == fs->e2fs_bsize)
 				bp->b_flags |= B_CLUSTEROK;
-			ext2_dep_bdwrite(bp);
+			ext2_dep_defer(bp, EXT2_SD_ASYNC_NEWBLK);
 			bp = NULL;
 		}
 	}
