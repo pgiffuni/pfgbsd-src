@@ -460,7 +460,7 @@ ext2_htree_writebuf(struct inode* ip, struct ext2fs_htree_lookup_info *info)
 	for (i = info->h_levels_num; i-- > 0; ) {
 		struct buf *bp = info->h_levels[i].h_bp;
 		ext2_dx_csum_set(ip, (struct ext2fs_direct_2 *)bp->b_data);
-		error = ext2_dep_bwrite(bp);
+		error = ext2_dep_write(bp, EXT2_SD_ASYNC_DIR);
 		if (error)
 			return (error);
 	}
@@ -760,10 +760,10 @@ ext2_htree_create_index(struct vnode *vp, struct componentname *cnp,
 	 */
 	ext2_dx_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
 	if (DOINGASYNC(vp)) {
-		ext2_dep_bdwrite(bp);
+		ext2_dep_defer(bp, EXT2_SD_ASYNC_DIR);
 		error = 0;
 	} else {
-		error = ext2_dep_bwrite(bp);
+		error = ext2_dep_write(bp, EXT2_SD_ASYNC_DIR);
 	}
 	bp = NULL;
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
@@ -887,7 +887,7 @@ ext2_htree_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry,
 			/* Write new index node to disk */
 			ext2_dx_csum_set(ip,
 			    (struct ext2fs_direct_2 *)dst_bp->b_data);
-			error = ext2_dep_bwrite(dst_bp);
+			error = ext2_dep_write(dst_bp, EXT2_SD_ASYNC_DIR);
 			ip->i_flag |= IN_CHANGE | IN_UPDATE;
 			if (error)
 				goto finish;
@@ -943,7 +943,7 @@ ext2_htree_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry,
 
 	/* Write the target directory block */
 	ext2_dirent_csum_set(ip, (struct ext2fs_direct_2 *)bp->b_data);
-	error = ext2_dep_bwrite(bp);
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_DIR);
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
 	if (error)
 		goto finish;
