@@ -1049,8 +1049,10 @@ ext2_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry)
 		ep = (struct ext2fs_direct_2 *)((char *)ep + dsize);
 	}
 	bcopy((caddr_t)entry, (caddr_t)ep, (u_int)newentrysize);
+	EXT2_CRASH(EXT2_CRASH_BEFORE_DIRENTER);
 	ext2_dirent_csum_set(dp, (struct ext2fs_direct_2 *)bp->b_data);
 	if (DOINGASYNC(dvp)) {
+		EXT2_CRASH(EXT2_CRASH_AFTER_DIRENTER);
 		ext2_dep_defer(bp, EXT2_SD_ASYNC_DIR);
 		error = 0;
 	} else {

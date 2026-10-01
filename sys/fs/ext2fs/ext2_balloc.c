@@ -52,6 +52,7 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_softdep.h>
+#include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_mount.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
@@ -262,6 +263,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		nbp = getblk(vp, indirs[i].in_lbn, fs->e2fs_bsize, 0, 0, 0);
 		nbp->b_blkno = fsbtodb(fs, pref);
 		vfs_bio_clrbuf(nbp);
+		EXT2_CRASH(EXT2_CRASH_AFTER_ALLOC);
 		/*
 		 * The new block must reach the disk before the parent names
 		 * it.  Record that as a dependency rather than relying on
@@ -280,6 +282,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * ext2_dep_drive().  Otherwise the new block is written
 		 * here, as before.
 		 */
+		EXT2_CRASH(EXT2_CRASH_BEFORE_INDIR_WRITE);
 		if (ext2_softdep_async & EXT2_SD_ASYNC_NEWBLK) {
 			ext2_dep_defer(nbp, EXT2_SD_ASYNC_NEWBLK);
 			error = 0;
@@ -290,7 +293,10 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 			brelse(bp);
 			return (error);
 		}
+		EXT2_CRASH(EXT2_CRASH_AFTER_INDIR_WRITE);
+		EXT2_CRASH(EXT2_CRASH_BEFORE_PARENT);
 		bap[indirs[i - 1].in_off] = htole32(pref);
+		EXT2_CRASH(EXT2_CRASH_AFTER_PARENT);
 		/*
 		 * If required, write synchronously, otherwise use
 		 * delayed write.  bwrite() and bdwrite() both release
