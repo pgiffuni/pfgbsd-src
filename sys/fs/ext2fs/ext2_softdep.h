@@ -69,17 +69,16 @@
  *
  * The panic is deliberate.  Continuing would let the operation finish and
  * repair the inconsistency, which is the opposite of what is being
- * tested.
+ * tested.  Both are off by default and cost one compare per point until
+ * enabled; the alternative, a build option, could not be added here
+ * because this tree has no in-tree ext2fs Makefile to declare one.
  */
-#ifdef EXT2FS_CRASH_TEST
 extern int ext2_crash_point;
+extern int ext2_crash_enabled;
 #define	EXT2_CRASH(n)	do {						\
-	if (ext2_crash_point == (n))					\
+	if (ext2_crash_enabled && ext2_crash_point == (n))		\
 		panic("ext2fs: injected crash at point %d", (n));	\
 } while (0)
-#else
-#define	EXT2_CRASH(n)	do { } while (0)
-#endif
 
 #define	EXT2_CRASH_AFTER_ALLOC		1	/* after physical allocation */
 #define	EXT2_CRASH_AFTER_BITMAP_ALLOC	2	/* after bitmap allocation */
