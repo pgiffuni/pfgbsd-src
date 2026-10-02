@@ -14,6 +14,7 @@ ATF_TESTS_C+=	basic		\
 		bridge		\
 		hub		\
 		ksocket		\
+		ng_modbus	\
 		socket		\
 		vlan_rotate	\
 
@@ -21,6 +22,7 @@ ATF_TESTS_SH+=	eiface_test
 
 SRCS.basic=	basic.c util.c
 SRCS.bridge=	bridge.c util.c
+SRCS.ng_modbus=	ng_modbus.c util.c
 SRCS.hub=	hub.c util.c
 SRCS.socket=	socket.c
 SRCS.vlan_rotate=vlan_rotate.c util.c
