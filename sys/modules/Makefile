@@ -272,6 +272,7 @@ SUBDIR=	\
 	${_mlx5ib} \
 	mmc \
 	mmcsd \
+	modbus \
 	${_mpi3mr} \
 	${_mpr} \
 	${_mps} \
