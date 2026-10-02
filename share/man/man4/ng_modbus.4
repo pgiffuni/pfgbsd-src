@@ -1,0 +1,261 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Pedro Giffuni
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd September 2, 2026
+.Dt NG_MODBUS 4
+.Os
+.Sh NAME
+.Nm ng_modbus
+.Nd Modbus protocol engine in netgraph
+.Sh SYNOPSIS
+.Nm ngctl
+.Ar create
+.Ar modbus
+.Nm ngctl
+.Ar config
+.Ar modbus
+.Cm setconfig
+.Op Ar role Ar = Ns Ar N
+.Op Ar transport Ar = Ns Ar N
+.Op Ar unit_id Ar = Ns Ar N
+.Nm ngctl
+.Ar config
+.Ar modbus
+.Cm request
+.Ar pdu Ar = Ns Ar N
+.Ar pdulen Ar = Ns Ar N
+.Ar unit_id Ar = Ns Ar N
+.Ar tid Ar = Ns Ar N
+.Nm ngctl
+.Ar config
+.Ar modbus
+.Cm setbackend
+.Ar ncoils Ar = Ns Ar N
+.Ar ndiscrete_in Ar = Ns Ar N
+.Ar ninput_regs Ar = Ns Ar N
+.Ar nholding_regs Ar = Ns Ar N
+.Sh DESCRIPTION
+The
+.Nm
+node type implements a Modbus server or client.
+It registers the type
+.Li modbus
+when the module is loaded and unregisters it when the module is unloaded.
+.Pp
+The protocol engine is independent of the transport.
+Requests are decoded from a request PDU, executed against a register
+backend, and answered with a response PDU;
+Modbus/TCP, RTU and ASCII add only their own framing around it.
+.Pp
+The node has one hook:
+.Bl -tag -width "lower" -compact
+.It Li lower
+Transport data.
+A peer supplies or receives the framed bytes described by
+.Cm transport .
+.El
+.Pp
+Control messages are addressed to the node itself and do not need a hook.
+.Sh CONFIGURATION
+.Bl -tag -width "setconfig" -compact
+.It Cm setconfig role= Ns Ar N transport= Ns Ar N unit_id= Ns Ar N
+Set the role, the framing and the unit identifier.
+.Cm role
+is
+.Dv MODBUS_ROLE_SERVER
+(1) or
+.Dv MODBUS_ROLE_CLIENT
+(2).
+.Cm transport
+is one of
+.Dv NONE
+(0), which carries one bare PDU per item and exists for testing,
+.Dv VNET
+(1),
+.Dv TCP
+(2), which uses the MBAP header,
+.Dv RTU
+(3), which uses the CRC framing, or
+.Dv ASCII
+(4), which uses the LRC framing.
+.Cm unit_id
+is this node's address, 0 for broadcast or 1 to 247.
+The specification reserves 248 to 255, and a configuration outside those
+bounds is refused.
+.It Cm getconfig
+Return the current configuration.
+.It Cm setbackend ncoils= Ns Ar N ndiscrete_in= Ns Ar N ninput_regs= Ns Ar N nholding_regs= Ns Ar N
+Resize the four register areas.
+Each must be between 1 and 4096; a rejected size leaves the existing map
+untouched.
+.It Cm getbackend
+Return the current sizes.
+.It Cm request pdu= Ns Ar N pdulen= Ns Ar N unit_id= Ns Ar N tid= Ns Ar N
+Issue one request as a client.
+.Cm pdu
+is the request PDU, without any framing, and
+.Cm pdulen
+its length.
+.Cm unit_id
+is the slave to address and
+.Cm tid
+the transaction identifier used by Modbus/TCP.
+A request is refused with EBUSY while another is still outstanding.
+.It Cm getresponse
+Return the response of the last client request:
+its state, which is one of idle, pending, done, expired or failed, and the
+response PDU when one was accepted.
+.It Cm getinfo
+Return the ABI version, the maximum PDU size, the largest ADU of the
+framings this build supports, the set of supported framings, and the default
+serial line parameters.
+.It Cm getstats
+Return the counters described in
+.Sx STATISTICS .
+.It Cm clrstats
+Zero the counters.
+.El
+.Sh DATA PATH
+Each item received on the
+.Li lower
+hook is fed to the configured framing one byte at a time, because a TCP
+stream, and a serial line, carry no packet boundaries.
+The framings own no timer: the RTU framing recognises a frame by its CRC, and
+reports the inter-character deadlines it computes for the node to act on.
+.Pp
+A request addressed to another unit identifier is ignored.
+A broadcast request, unit identifier zero, is executed but never answered,
+and a node configured with unit identifier zero answers nothing.
+.Pp
+Responses are framed the way the request arrived:
+an MBAP header carrying the request's transaction identifier for
+.Cm transport=TCP ,
+the unit address and the CRC for
+.Cm transport=RTU ,
+and a colon, hexadecimal characters, the LRC and CR LF for
+.Cm transport=ASCII .
+For
+.Cm transport=NONE
+and
+.Cm transport=VNET
+the response is the bare response PDU.
+.Sh FUNCTION CODES
+The following function codes are implemented:
+.Bl -tag -width "17 (0x17)" -compact
+.It 1 (0x01)
+Read Coils
+.It 2 (0x02)
+Read Discrete Inputs
+.It 3 (0x03)
+Read Holding Registers
+.It 4 (0x04)
+Read Input Registers
+.It 5 (0x05)
+Write Single Coil
+.It 6 (0x06)
+Write Single Register
+.It 15 (0x0F)
+Write Multiple Coils
+.It 16 (0x10)
+Write Multiple Registers
+.It 22 (0x16)
+Mask Write Register
+.It 23 (0x17)
+Read/Write Multiple Registers
+.El
+.Pp
+Any other function code is answered with exception code 1,
+ILLEGAL FUNCTION.
+Requests that violate a length, quantity or byte count rule are answered with
+exception code 3,
+ILLEGAL DATA VALUE,
+and addresses outside the configured map with exception code 2,
+ILLEGAL DATA ADDRESS.
+The remaining exception codes of the specification are defined but never
+generated by this implementation.
+.Sh STATISTICS
+.Bl -tag -width "rx_frames" -compact
+.It Li rx_frames
+Items received on the lower hook.
+.It Li rx_bytes
+Bytes received on the lower hook.
+.It Li tx_frames
+Response frames transmitted.
+.It Li tx_bytes
+Bytes transmitted.
+.It Li errors
+Malformed frames, CRC and LRC failures, invalid function codes, protocol
+exceptions, allocation failures and rejected items.
+.El
+.Pp
+A client transaction also counts as
+.Dv errors
+when the response cannot be used.
+.It Li timeouts
+Client transactions that expired with no response.
+.El
+.Sh EXAMPLES
+Create a server holding 1024 coils and holding registers, and answer a
+Modbus/TCP peer:
+.Bd -literal -offset indent
+kldload modbus
+ngctl create modbus
+ngctl config modbus setconfig role=1 transport=2 unit_id=1
+ngctl config modbus setbackend ncoils=1024 nholding_regs=1024
+ngctl connect modbus: lower ng_ksocket:inet/stream/tcp/502
+.Ed
+.Pp
+Talk to it over a virtual transport, one PDU per item, from a test harness:
+.Bd -literal -offset indent
+ngctl create modbus
+ngctl config modbus setconfig role=1 transport=1 unit_id=1
+.Ed
+.Sh CAVEATS
+The client role issues one request at a time and does not retry.
+A transaction that has no response within
+.Dv MODBUS_CLIENT_TIMEOUT_MS
+milliseconds is given up and counted in the
+.Li timeouts
+statistic.
+.Pp
+No RS-485 direction control is available in the serial drivers, so half
+duplex lines need a transceiver with automatic direction control.
+.Pp
+RTU framing depends on silence to delimit frames.
+A frame that is still incomplete when the line has been quiet for
+.Ms 3.5
+character times is discarded.
+The character times are computed from the configured baud rate and bits per
+character, and the specification's fixed values are used above 19200 Bd, but a
+software timer is not exact: above 19200 Bd the t3.5 gap of 1.750 ms can be
+missed or measured late, and this implementation makes no real-time claim.
+.Sh SEE ALSO
+.Xr ngctl 8 ,
+.Xr ng_ksocket 4 ,
+.Xr ng_tty 4
+.Sh AUTHORS
+The
+.Nm
+node and the Modbus implementation were written for FreeBSD.
