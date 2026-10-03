@@ -399,3 +399,47 @@ ext2_dep_cancel(struct ext2_dep *dep)
 	ext2_dep_unlink(dep);
 	ext2_dep_rele(dep);
 }
+
+/*
+ * Diagnostics.  "outstanding" is the one to watch: it counts live
+ * dependency objects across all mounts and should settle back to zero
+ * when the filesystem is idle.  A count that only grows means something
+ * is holding a dependency past the buffer that owned it.
+ */
+static SYSCTL_NODE(_vfs, OID_AUTO, ext2fs_softdep,
+    CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "EXT2FS metadata dependency counters");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, created, CTLFLAG_RD,
+    &ext2_softdep_created, 0, "Dependencies created since boot");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, satisfied, CTLFLAG_RD,
+    &ext2_softdep_satisfied, 0, "Dependencies satisfied since boot");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, cancelled, CTLFLAG_RD,
+    &ext2_softdep_cancelled, 0, "Dependencies cancelled since boot");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, outstanding, CTLFLAG_RD,
+    &ext2_softdep_outstanding, 0,
+    "Live dependency objects; should settle to zero when idle");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, async, CTLFLAG_RW,
+    &ext2_softdep_async, 0,
+    "Which metadata writes may be deferred to the flush path instead of "
+    "written synchronously. Ordering is still enforced by ext2_strategy. "
+    "1=new indirect block, 2=extent tree metadata, 4=directory "
+    "metadata. Enable one at a time; 0 until crash tested");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, crash_enable, CTLFLAG_RW,
+    &ext2_crash_enabled, 0,
+    "Allow write-ordering crash injection. This panics the kernel on "
+    "purpose and is for testing only; it takes effect at the next "
+    "operation reaching crash_point");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, crash_point, CTLFLAG_RW,
+    &ext2_crash_point, 0,
+    "Write-ordering point to crash at, 1..19; see ext2_softdep.h");
+
+SYSCTL_INT(_vfs_ext2fs_softdep, OID_AUTO, debug, CTLFLAG_RW,
+    &ext2_softdep_debug, 0,
+    "Report dependency objects freed while still referenced");
