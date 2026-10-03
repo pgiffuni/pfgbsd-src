@@ -359,7 +359,8 @@ ext2_dep_satisfy(struct ext2_dep *dep)
 
 	EXT2_SOFTDEP_LOCK(sd);
 	KASSERT(dep->dep_state == EXT2_DEP_PENDING,
-	    ("ext2_dep_satisfy: %s already terminal", dep->dep_type));
+	    ("ext2_dep_satisfy: %s already terminal",
+		    ext2_dep_typenames[dep->dep_type]));
 	dep->dep_state = EXT2_DEP_SATISFIED;
 	if (dep->dep_bp != NULL) {
 		EXT2_BP_DEP_CLEAR(dep->dep_bp);
@@ -386,7 +387,8 @@ ext2_dep_cancel(struct ext2_dep *dep)
 
 	EXT2_SOFTDEP_LOCK(sd);
 	KASSERT(dep->dep_state == EXT2_DEP_PENDING,
-	    ("ext2_dep_cancel: %s already terminal", dep->dep_type));
+	    ("ext2_dep_cancel: %s already terminal",
+		    ext2_dep_typenames[dep->dep_type]));
 	dep->dep_state = EXT2_DEP_CANCELLED;
 	if (dep->dep_bp != NULL) {
 		EXT2_BP_DEP_CLEAR(dep->dep_bp);
