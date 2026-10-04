@@ -67,6 +67,14 @@ struct ext2mount {
 	 * slot for an operation to join.
 	 */
 	struct ext2_journal_trans	*um_jtrans;
+	/*
+	 * Nesting depth.  An extent operation can reach another one -- a
+	 * truncate that rewrites the tail block allocates through
+	 * ext4_ext_get_blocks() -- and the inner work belongs to the outer
+	 * operation's transaction, not a new one.  Only the outermost
+	 * commit makes the whole thing recoverable.
+	 */
+	int			um_jtrans_depth;
 };
 
 #define	EXT2_LOCK(aa)		mtx_lock(&(aa)->um_lock)

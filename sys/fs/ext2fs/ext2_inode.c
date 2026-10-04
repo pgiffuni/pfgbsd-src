@@ -55,6 +55,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/fs.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_journal.h>
 #include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_extattr.h>
 
@@ -511,10 +512,23 @@ ext2_ext_truncate(struct vnode *vp, off_t length, int flags,
 		return (ext2_update(ovp, !DOINGASYNC(ovp)));
 	}
 
-	lastblock = (length + fs->e2fs_bsize - 1) / fs->e2fs_bsize;
-	error = ext4_ext_remove_space(oip, lastblock, flags, cred, td);
+	/*
+	 * Shrinking is one operation: the tree edits that drop extents, the
+	 * data and tree blocks those extents release, and the new i_size
+	 * that stops anything reading them.  Soft Updates cannot express
+	 * that set, so one transaction covers all of it; every block freed
+	 * along the way is revoked through ext4_ext_blkfree().
+	 */
+	error = ext2_op_start(oip, 1, 64);
 	if (error)
 		return (error);
+
+	lastblock = (length + fs->e2fs_bsize - 1) / fs->e2fs_bsize;
+	error = ext4_ext_remove_space(oip, lastblock, flags, cred, td);
+	if (error) {
+		ext2_op_abort(oip);
+		return (error);
+	}
 
 	offset = blkoff(fs, length);
 	if (offset == 0) {
@@ -524,6 +538,7 @@ ext2_ext_truncate(struct vnode *vp, off_t length, int flags,
 		flags |= BA_CLRBUF;
 		error = ext2_balloc(oip, lbn, offset, cred, &bp, flags);
 		if (error) {
+			ext2_op_abort(oip);
 			return (error);
 		}
 		oip->i_size = length;
@@ -542,14 +557,27 @@ ext2_ext_truncate(struct vnode *vp, off_t length, int flags,
 
 	oip->i_size = osize;
 	error = vtruncbuf(ovp, length, (int)fs->e2fs_bsize);
-	if (error)
+	if (error) {
+		ext2_op_abort(oip);
 		return (error);
+	}
 
 	vnode_pager_setsize(ovp, length);
 
 	oip->i_size = length;
 	oip->i_flag |= IN_CHANGE | IN_UPDATE;
-	error = ext2_update(ovp, !DOINGASYNC(ovp));
+	/*
+	 * The inode now records the new size.  Commit before publishing:
+	 * until the commit record is on disk the new size and the blocks it
+	 * releases are recoverable only together, and a truncate that has
+	 * dropped the extents but not recorded the size has lost them.
+	 */
+	if (error == 0)
+		error = ext2_op_end(oip);
+	else
+		ext2_op_abort(oip);
+	if (error == 0)
+		error = ext2_update(ovp, !DOINGASYNC(ovp));
 
 	return (error);
 }
