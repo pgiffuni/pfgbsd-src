@@ -1209,6 +1209,20 @@ loop:
 	}
 
 	/*
+	 * Write journalled metadata to its home locations.  A checkpoint is
+	 * not itself a durability event -- the data is already recoverable
+	 * from the journal -- but until it runs the journal is the only copy,
+	 * so a caller that asked for the filesystem to be written back has
+	 * not been given what it asked for.
+	 *
+	 * It runs after the per-vnode flush, because a checkpoint writes
+	 * metadata the journal copied, not the file data that flush just
+	 * wrote.
+	 */
+	if ((error = ext2_journal_checkpoint_if_needed(ump)) != 0)
+		allerror = error;
+
+	/*
 	 * Write back modified superblock.
 	 */
 	if (fs->e2fs_fmod != 0) {
