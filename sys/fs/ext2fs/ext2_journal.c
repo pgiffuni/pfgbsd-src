@@ -904,7 +904,9 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	if (error)
 		goto fail;
 
-	ext2_journal_next_sequence++;
+	/* Past every committed sequence, so the check above holds. */
+	if (t->jt_sequence >= ext2_journal_next_sequence)
+		ext2_journal_next_sequence = t->jt_sequence + 1;
 	ext2_journal_trans_abort(t);
 	return (0);
 
@@ -955,6 +957,20 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 		    (int)j->j_blocksize, NOCRED, &jbp);
 		if (error)
 			return (error);
+
+		/*
+		 * Data blocks are not journal blocks and carry no header to
+		 * check, so there is nothing in the buffer that says whose
+		 * data it is.  What can be checked is that the entry still
+		 * refers to a transaction we committed, since the log may
+		 * have wrapped and the position been reused since.  Copying
+		 * whatever is there now would write an unrelated
+		 * transaction's metadata over this block.
+		 */
+		if (ck->ck_sequence > ext2_journal_next_sequence) {
+			brelse(jbp);
+			return (EINVAL);
+		}
 
 		bp = getblk(ump->um_devvp, (daddr_t)ck->ck_blocknr,
 		    (int)bsize, 0, 0, 0);
