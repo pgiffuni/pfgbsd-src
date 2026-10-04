@@ -101,6 +101,32 @@ extern int ext2_crash_enabled;
 #define	EXT2_CRASH_AFTER_ORPHAN_REMOVE	19	/* after orphan removal */
 
 /*
+ * Journal points continue the same numbering.  These matter more than the
+ * Soft Updates ones, in one respect: the Soft Updates failures all leave
+ * the filesystem in a state something can detect and repair, whereas a
+ * journal boundary computed wrongly discards transactions quietly.  Each
+ * point therefore sits immediately before or after the operation whose
+ * durability it is testing, never somewhere both sides are equally
+ * uninteresting.
+ */
+#define	EXT2_CRASH_JOURNAL_OPEN		20	/* after journal open */
+#define	EXT2_CRASH_TRANS_START		21	/* after transaction start */
+#define	EXT2_CRASH_METADATA_ACCESS	22	/* after journal write access */
+#define	EXT2_CRASH_DESC_WRITE		23	/* after descriptor write */
+#define	EXT2_CRASH_DATA_WRITE		24	/* after a data block write */
+#define	EXT2_CRASH_REVOKE_WRITE		25	/* after revoke block write */
+#define	EXT2_CRASH_COMMIT_WRITE		26	/* after the commit record */
+#define	EXT2_CRASH_COMMIT_BEFORE	27	/* just before the commit record */
+#define	EXT2_CRASH_CKPT_BLOCK		28	/* after a block reaches home */
+#define	EXT2_CRASH_CKPT_DONE		29	/* after the whole checkpoint */
+#define	EXT2_CRASH_SB_UPDATE		30	/* after journal superblock write */
+#define	EXT2_CRASH_SB_BEFORE		31	/* just before it */
+#define	EXT2_CRASH_RECLAIM		32	/* after start block advanced */
+#define	EXT2_CRASH_RECOVERY_PASS	33	/* after each recovery pass */
+#define	EXT2_CRASH_REPLAY_BLOCK		34	/* after a block replayed */
+#define	EXT2_CRASH_MAX			34
+
+/*
  * Dependency types.
  *
  * EXT2_DEP_NEWBLK	guards a freshly allocated metadata block that is not
