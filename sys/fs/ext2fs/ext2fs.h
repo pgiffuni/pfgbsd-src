@@ -321,7 +321,14 @@ static const struct ext2_feature incompat[] = {
  * - EXT2F_INCOMPAT_EXTENTS
  *
  */
-#define	EXT2F_COMPAT_SUPP		EXT2F_COMPAT_DIRHASHINDEX
+/*
+ * A filesystem with an internal journal is supported: the journal reader
+ * is what recovers it.  HASJOURNAL is listed here so that a filesystem
+ * carrying one is recognised rather than silently treated as if it had
+ * none.
+ */
+#define	EXT2F_COMPAT_SUPP	(EXT2F_COMPAT_DIRHASHINDEX |		\
+				 EXT2F_COMPAT_HASJOURNAL)
 #define	EXT2F_ROCOMPAT_SUPP		(EXT2F_ROCOMPAT_SPARSESUPER | \
 					 EXT2F_ROCOMPAT_LARGEFILE | \
 					 EXT2F_ROCOMPAT_GDT_CSUM | \
