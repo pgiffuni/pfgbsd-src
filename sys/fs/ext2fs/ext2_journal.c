@@ -622,6 +622,7 @@ ext2_journal_trans_start(struct ext2_journal *j, uint32_t nblocks,
 	t->jt_sequence = ext2_journal_next_sequence;
 	t->jt_reserved = nblocks;
 	STAILQ_INIT(&t->jt_bufs);
+	STAILQ_INIT(&t->jt_revokes);
 	*tp = t;
 	return (0);
 }
@@ -667,11 +668,32 @@ ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 int
 ext2_journal_revoke_block(struct ext2_journal_trans *t, uint64_t blocknr)
 {
+	struct ext2_journal_revoke *rv;
 
 	if (t->jt_error)
 		return (t->jt_error);
-	if (t->jt_journal->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_REVOKE)
-		t->jt_dirty = 1;
+
+	/*
+	 * Without the REVOKE feature there is no way to record this, and a
+	 * journal that silently drops revocations would let replay write a
+	 * freed block over its new owner.  Say so rather than proceed.
+	 */
+	if (!(t->jt_journal->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_REVOKE))
+		return (ENOTSUP);
+
+	STAILQ_FOREACH(rv, &t->jt_revokes, jr_link) {
+		if (rv->jr_blocknr == blocknr)
+			return (0);
+	}
+	rv = malloc(sizeof(*rv), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (rv == NULL) {
+		t->jt_error = ENOMEM;
+		return (ENOMEM);
+	}
+	rv->jr_blocknr = blocknr;
+	STAILQ_INSERT_TAIL(&t->jt_revokes, rv, jr_link);
+	t->jt_revoked = 1;
+	t->jt_dirty = 1;
 	return (0);
 }
 
@@ -679,11 +701,14 @@ void
 ext2_journal_trans_abort(struct ext2_journal_trans *t)
 {
 	struct ext2_journal_buf *jb;
+	struct ext2_journal_revoke *rv;
 
 	if (t == NULL)
 		return;
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
 		free(jb, M_EXT2JOURNAL);
+	STAILQ_FOREACH(rv, &t->jt_revokes, jr_link)
+		free(rv, M_EXT2JOURNAL);
 	free(t, M_EXT2JOURNAL);
 }
 
@@ -707,6 +732,7 @@ int
 ext2_journal_trans_commit(struct ext2_journal_trans *t)
 {
 	struct ext2_journal_buf *jb;
+	struct ext2_journal_revoke *jr;
 	struct ext2_journal *j;
 	struct ext2mount *ump;
 	struct buf *bp;
@@ -803,6 +829,53 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		vfs_bio_clrbuf(bp);
 		memcpy(bp->b_data, jb->jb_bp->b_data,
 		    (size_t)j->j_blocksize);
+		error = bwrite(bp);
+		if (error)
+			goto fail;
+	}
+
+	/*
+	 * Revoke, if this transaction has any.  It belongs after the data
+	 * blocks and before the commit record: the commit is what makes the
+	 * whole transaction replayable, and a revoke that lands after the
+	 * commit would not be covered by it.
+	 */
+	if (t->jt_revoked) {
+		int wide = (j->j_feature_incompat &
+		    EXT2_JOURNAL_INCOMPAT_64BIT) != 0;
+		uint8_t *p;
+		uint32_t count = 0;
+
+		bp = getblk(ump->um_devvp, (daddr_t)ext2_journal_cursor(j),
+		    (int)j->j_blocksize, 0, 0, 0);
+		if (bp == NULL) {
+			error = ENOMEM;
+			goto fail;
+		}
+		vfs_bio_clrbuf(bp);
+		ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_REVOKE,
+		    t->jt_sequence);
+
+		p = (uint8_t *)bp->b_data + 0x0c;
+		STAILQ_FOREACH(jr, &t->jt_revokes, jr_link) {
+			if (wide)
+				be64enc(p, jr->jr_blocknr);
+			else
+				be32enc(p, (uint32_t)jr->jr_blocknr);
+			p += wide ? 8 : 4;
+			count += wide ? 8 : 4;
+		}
+		/*
+		 * r_count is the number of bytes this block uses, including
+		 * the header and any tail -- not the number of entries.
+		 * Storing an entry count here is the single easiest way to
+		 * make a revoke list mean something else entirely.
+		 */
+		count += 0x10;		/* header plus r_count itself */
+		if (ext2_journal_csum_blocks(j))
+			count += 4;
+		be32enc((uint8_t *)bp->b_data + 0x0c, count);
+
 		error = bwrite(bp);
 		if (error)
 			goto fail;
@@ -952,4 +1025,158 @@ ext2_journal_destroy(struct ext2_journal *j)
 	mtx_destroy(&j->j_lock);
 	free(j->j_sb, M_EXT2JOURNAL);
 	free(j, M_EXT2JOURNAL);
+}
+
+/*
+ * Classification.  See ext2_journal_mining.md K.
+ *
+ * Kept deliberately small and deliberately in one place.  Adding a case
+ * here is the only way to change which mechanism owns an operation, which
+ * is what makes the decision reviewable.
+ */
+enum ext2_op_consistency
+ext2_op_classify(struct inode *ip, int extent_operation)
+{
+
+	/*
+	 * Only extent-mapped inodes lack a Soft Updates representation.
+	 * Everything else -- direct blocks, indirect blocks at any depth,
+	 * directory entries, orphan state -- is ordered by the dependency
+	 * graph or by synchronous writes that the graph checks, and adding
+	 * a journal transaction there would duplicate ordering that already
+	 * exists rather than add any.
+	 */
+	if (extent_operation && (ip->i_flag & IN_E4EXTENTS))
+		return (EXT2_OP_JOURNAL);
+	return (EXT2_OP_SU);
+}
+
+/*
+ * Operation scope.
+ *
+ * The unit of journalling is the filesystem operation, not the buffer.
+ * An extent insertion that touches the inode, an index block and a leaf
+ * is one transaction: journalling the leaf alone would leave the other
+ * two recoverable at different moments, which is the partially journaled
+ * operation the design forbids.
+ *
+ * These are the only entry points an operation uses.  ext2_op_start()
+ * refuses when Soft Updates already covers the operation, so a plain
+ * ext2 path never opens a transaction and therefore never pays for one.
+ */
+int
+ext2_op_start(struct inode *ip, int extent_operation, uint32_t nblocks)
+{
+	struct ext2mount *ump = ip->i_ump;
+	struct ext2_journal_trans *t;
+	int error;
+
+	if (ext2_op_classify(ip, extent_operation) != EXT2_OP_JOURNAL)
+		return (0);
+	if (ump->um_journal == NULL)
+		return (0);
+	if (ump->um_jtrans != NULL) {
+		/*
+		 * A transaction is already open for this operation.  Nesting
+		 * would mean the inner commit could not make the outer
+		 * operation recoverable, so it is refused rather than
+		 * silently merged.
+		 */
+		return (EINVAL);
+	}
+
+	error = ext2_journal_trans_start(ump->um_journal, nblocks, &t);
+	if (error)
+		return (error);
+	ump->um_jtrans = t;
+	return (0);
+}
+
+/*
+ * Close the operation's transaction.
+ *
+ * A failure here means the operation's metadata is not recoverable, so
+ * the caller must fail the operation and roll back only what the
+ * allocator still considers unpublished.  It is never downgraded to an
+ * unjournalled success.
+ */
+int
+ext2_op_end(struct inode *ip)
+{
+	struct ext2mount *ump = ip->i_ump;
+	struct ext2_journal_trans *t = ump->um_jtrans;
+	int error;
+
+	if (t == NULL)
+		return (0);
+	ump->um_jtrans = NULL;
+	error = ext2_journal_trans_commit(t);
+	return (error);
+}
+
+void
+ext2_op_abort(struct inode *ip)
+{
+	struct ext2mount *ump = ip->i_ump;
+	struct ext2_journal_trans *t = ump->um_jtrans;
+
+	if (t == NULL)
+		return;
+	ump->um_jtrans = NULL;
+	ext2_journal_trans_abort(t);
+}
+
+/*
+ * Mount integration.
+ *
+ * Opens the journal if the filesystem has one, and replays it.  A
+ * filesystem with no journal is not an error: it is covered by Soft
+ * Updates, which is the point of the hybrid.
+ *
+ * A journal that is present but unreadable -- unsupported features, a
+ * UUID that does not match, corruption -- stops the mount.  Mounting it
+ * read-only and hoping is how a filesystem whose metadata lives in the
+ * journal gets overwritten by writes that know nothing about it.
+ */
+int
+ext2_mount_journal(struct ext2mount *ump, int ronly)
+{
+	struct m_ext2fs *fs = ump->um_e2fs;
+	struct ext2_journal *j;
+	int error;
+
+	if (fs->e2fs->e3fs_journal_inum == 0 &&
+	    (fs->e2fs->e2fs_features_compat & EXT2F_COMPAT_HASJOURNAL) == 0)
+		return (0);			/* no journal; Soft Updates covers it */
+
+	error = ext2_journal_open_journal(ump, fs, &j);
+	if (error) {
+		printf("ext2fs: %s: journal unusable, mount refused (%d)\n",
+		    fs->e2fs_fsmnt, error);
+		return (error);
+	}
+	ump->um_journal = j;
+
+	if (ronly) {
+		printf("ext2fs: %s: journal present; read-only mount, "
+		    "nothing replayed\n", fs->e2fs_fsmnt);
+		return (0);
+	}
+
+	error = ext2_journal_recover(j);
+	if (error) {
+		printf("ext2fs: %s: journal recovery failed (%d)\n",
+		    fs->e2fs_fsmnt, error);
+		return (error);
+	}
+	return (0);
+}
+
+void
+ext2_unmount_journal(struct ext2mount *ump)
+{
+
+	ext2_journal_destroy(ump->um_journal);
+	ump->um_journal = NULL;
+	ump->um_jtrans = NULL;
 }
