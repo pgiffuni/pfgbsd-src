@@ -59,6 +59,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_journal.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 #include <sys/gsb_crc32.h>
 
@@ -645,6 +646,7 @@ ext2_journal_trans_start(struct ext2_journal *j, uint32_t nblocks,
 	STAILQ_INIT(&t->jt_bufs);
 	STAILQ_INIT(&t->jt_revokes);
 	*tp = t;
+	EXT2_CRASH(EXT2_CRASH_TRANS_START);
 	return (0);
 }
 
@@ -679,6 +681,7 @@ ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 	jb->jb_bp = bp;
 	STAILQ_INSERT_TAIL(&t->jt_bufs, jb, jb_link);
 	t->jt_dirty = 1;
+	EXT2_CRASH(EXT2_CRASH_METADATA_ACCESS);
 	return (0);
 }
 
@@ -860,10 +863,15 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	error = bwrite(bp);
 	if (error)
 		goto fail;
+	EXT2_CRASH(EXT2_CRASH_DESC_WRITE);
 
 	/* The data blocks, in the same order as the tags. */
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
-		bp = getblk(ump->um_devvp, (daddr_t)ext2_journal_cursor(j),
+		struct ext2_journal_ckpt *ck;
+		uint32_t jblock;
+
+		jblock = ext2_journal_cursor(j);
+		bp = getblk(ump->um_devvp, (daddr_t)jblock,
 		    (int)j->j_blocksize, 0, 0, 0);
 		if (bp == NULL) {
 			error = ENOMEM;
@@ -875,6 +883,23 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		error = bwrite(bp);
 		if (error)
 			goto fail;
+
+		/*
+		 * Record where this block lives in the log so checkpoint can
+		 * write it home.  Without this the queue stays empty,
+		 * checkpoint writes nothing, and the log is reclaimed while
+		 * the journal is still the only copy of the metadata.
+		 */
+		ck = malloc(sizeof(*ck), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+		if (ck == NULL) {
+			error = ENOMEM;
+			goto fail;
+		}
+		ck->ck_blocknr = (uint64_t)jb->jb_bp->b_blkno;
+		ck->ck_jblock = jblock;
+		ck->ck_sequence = t->jt_sequence;
+		STAILQ_INSERT_TAIL(&j->j_ckpt, ck, ck_link);
+		EXT2_CRASH(EXT2_CRASH_DATA_WRITE);
 	}
 
 	/*
@@ -927,6 +952,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		error = bwrite(bp);
 		if (error)
 			goto fail;
+		EXT2_CRASH(EXT2_CRASH_REVOKE_WRITE);
 	}
 
 	/*
@@ -940,11 +966,13 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		goto fail;
 	}
 	vfs_bio_clrbuf(bp);
+	EXT2_CRASH(EXT2_CRASH_COMMIT_BEFORE);
 	ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_COMMIT,
 	    t->jt_sequence);
 	error = bwrite(bp);
 	if (error)
 		goto fail;
+	EXT2_CRASH(EXT2_CRASH_COMMIT_WRITE);
 
 	/* Past every committed sequence, so the check above holds. */
 	if (t->jt_sequence >= ext2_journal_next_sequence)
@@ -1036,6 +1064,7 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 
 		STAILQ_REMOVE(&j->j_ckpt, ck, ext2_journal_ckpt, ck_link);
 		free(ck, M_EXT2JOURNAL);
+		EXT2_CRASH(EXT2_CRASH_CKPT_BLOCK);
 	}
 
 	/*
@@ -1068,7 +1097,9 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 			j->j_sequence = old_seq;
 			return (error);
 		}
+		EXT2_CRASH(EXT2_CRASH_RECLAIM);
 	}
+	EXT2_CRASH(EXT2_CRASH_CKPT_DONE);
 
 	return (0);
 }
@@ -1336,8 +1367,10 @@ ext2_journal_write_sb(struct ext2_journal *j)
 	}
 	memcpy(bp->b_data, sb, EXT2_JOURNAL_SB_SIZE);
 	vfs_bio_clrbuf(bp);
+	EXT2_CRASH(EXT2_CRASH_SB_BEFORE);
 	error = bwrite(bp);
 	free(sb, M_EXT2JOURNAL);
+	EXT2_CRASH(EXT2_CRASH_SB_UPDATE);
 	return (error);
 }
 
@@ -1371,6 +1404,7 @@ ext2_mount_journal(struct ext2mount *ump, int ronly)
 		return (error);
 	}
 	ump->um_journal = j;
+	EXT2_CRASH(EXT2_CRASH_JOURNAL_OPEN);
 
 	if (ronly) {
 		printf("ext2fs: %s: journal present; read-only mount, "
