@@ -55,6 +55,14 @@
 
 SDT_PROVIDER_DECLARE(ext2fs);
 
+/*
+ * ext2_alloc.c defines this probe; here it is only used.  Without
+ * KDTRACE_HOOKS every SDT macro expands to nothing, so the missing
+ * declaration is invisible in an ordinary build and only breaks a kernel
+ * built with tracing hooks, where the probe name is a real symbol.
+ */
+SDT_PROBE_DECLARE(ext2fs, , alloc, trace);
+
 static int
 ext2_ext_balloc(struct inode *ip, uint32_t lbn, int size,
     struct ucred *cred, struct buf **bpp, int flags)
