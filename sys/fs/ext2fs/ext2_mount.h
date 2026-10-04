@@ -59,6 +59,14 @@ struct ext2mount {
 
 	struct g_consumer *um_cp;
 	struct bufobj *um_bo;
+	struct ext2_journal	*um_journal;
+	/*
+	 * The transaction covering the operation in progress, or NULL.
+	 * Scope is the operation: it is created when one starts and
+	 * destroyed when it commits or aborts.  There is deliberately no
+	 * slot for an operation to join.
+	 */
+	struct ext2_journal_trans	*um_jtrans;
 };
 
 #define	EXT2_LOCK(aa)		mtx_lock(&(aa)->um_lock)
