@@ -154,10 +154,10 @@ ext2_journal_revoked_p(struct ext2_journal_scan *sc, uint64_t blocknr,
 	return (0);
 }
 
-static struct ext2_journal_trans *
-ext2_journal_trans_get(struct ext2_journal_scan *sc, uint32_t sequence)
+static struct ext2_journal_scan_trans *
+ext2_journal_scan_trans_get(struct ext2_journal_scan *sc, uint32_t sequence)
 {
-	struct ext2_journal_trans *tr;
+	struct ext2_journal_scan_trans *tr;
 
 	STAILQ_FOREACH(tr, &sc->sc_trans, tr_link) {
 		if (tr->tr_sequence == sequence)
@@ -175,14 +175,14 @@ ext2_journal_trans_get(struct ext2_journal_scan *sc, uint32_t sequence)
 void
 ext2_journal_scan_free(struct ext2_journal_scan *sc)
 {
-	struct ext2_journal_trans *tr, *ntr;
+	struct ext2_journal_scan_trans *tr, *ntr;
 	struct ext2_journal_filedesc *fd, *nfd;
 	struct ext2_journal_revoked *rv, *nrv;
 
 	STAILQ_FOREACH_SAFE(tr, &sc->sc_trans, tr_link, ntr) {
 		STAILQ_FOREACH_SAFE(fd, &tr->tr_filedescs, fd_link, nfd)
 			free(fd, M_EXT2JOURNAL);
-		STAILQ_REMOVE(&sc->sc_trans, tr, ext2_journal_trans, tr_link);
+		STAILQ_REMOVE(&sc->sc_trans, tr, ext2_journal_scan_trans, tr_link);
 		free(tr, M_EXT2JOURNAL);
 	}
 	STAILQ_FOREACH_SAFE(rv, &sc->sc_revoked, jr_link, nrv) {
@@ -207,7 +207,7 @@ static int
 ext2_journal_scan_pass(struct ext2_journal *j, struct ext2_journal_scan *sc,
     uint32_t start, uint32_t *endp)
 {
-	struct ext2_journal_trans *tr;
+	struct ext2_journal_scan_trans *tr;
 	struct ext2_journal_filedesc *fd;
 	struct ext2_journal_tag *tags = NULL;
 	struct ext2fs_journal_bhdr bh;
@@ -253,7 +253,7 @@ ext2_journal_scan_pass(struct ext2_journal *j, struct ext2_journal_scan *sc,
 				brelse(bp);
 				return (error);
 			}
-			tr = ext2_journal_trans_get(sc, bh.bh_sequence);
+			tr = ext2_journal_scan_trans_get(sc, bh.bh_sequence);
 			if (tr == NULL) {
 				free(tags, M_EXT2JOURNAL);
 				brelse(bp);
@@ -290,7 +290,7 @@ ext2_journal_scan_pass(struct ext2_journal *j, struct ext2_journal_scan *sc,
 			break;
 
 		case EXT2_JOURNAL_BT_COMMIT:
-			tr = ext2_journal_trans_get(sc, bh.bh_sequence);
+			tr = ext2_journal_scan_trans_get(sc, bh.bh_sequence);
 			if (tr == NULL) {
 				brelse(bp);
 				return (ENOMEM);
@@ -318,7 +318,7 @@ ext2_journal_scan_pass(struct ext2_journal *j, struct ext2_journal_scan *sc,
 				brelse(bp);
 				return (error);
 			}
-			tr = ext2_journal_trans_get(sc, bh.bh_sequence);
+			tr = ext2_journal_scan_trans_get(sc, bh.bh_sequence);
 			if (tr == NULL) {
 				free(revoked, M_EXT2JOURNAL);
 				brelse(bp);
@@ -371,7 +371,7 @@ ext2_journal_scan_pass(struct ext2_journal *j, struct ext2_journal_scan *sc,
 int
 ext2_journal_scan(struct ext2_journal *j, struct ext2_journal_scan *sc)
 {
-	struct ext2_journal_trans *tr;
+	struct ext2_journal_scan_trans *tr;
 	int error;
 
 	STAILQ_INIT(&sc->sc_trans);
@@ -440,7 +440,7 @@ ext2_journal_replay_block(struct ext2_journal *j, uint64_t blocknr,
 static int
 ext2_journal_replay(struct ext2_journal *j, struct ext2_journal_scan *sc)
 {
-	struct ext2_journal_trans *tr, *best;
+	struct ext2_journal_scan_trans *tr, *best;
 	struct ext2_journal_filedesc *fd;
 	struct ext2mount *ump = j->j_mount;
 	struct buf *jbp;
