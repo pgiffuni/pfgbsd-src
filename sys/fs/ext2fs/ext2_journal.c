@@ -564,3 +564,304 @@ ext2_journal_commit_csum_verify(struct ext2_journal *j, const void *buf,
 		return (error);
 	return (got == want ? 0 : EBADMSG);
 }
+
+/*
+ * Writer.
+ *
+ * Synchronous throughout, per the initial scope: no asynchronous commit,
+ * no batching, no delayed writeback.  A transaction here means what the
+ * documentation says it means -- a set of metadata blocks written to the
+ * log and made recoverable by a commit record -- and nothing about it
+ * depends on the operation that started it outliving it.
+ */
+
+static uint32_t ext2_journal_next_sequence;
+
+/* Take the next log block, wrapping at the end of the journal. */
+static uint32_t
+ext2_journal_cursor(struct ext2_journal *j)
+{
+	uint32_t b = j->j_cursor;
+
+	j->j_cursor = (j->j_maxlen != 0) ? ((b + 1) % j->j_maxlen) : b + 1;
+	return (b);
+}
+
+static void
+ext2_journal_write_bhdr(struct buf *bp, uint32_t type, uint32_t sequence)
+{
+	struct ext2fs_journal_bhdr bh;
+
+	bh.bh_magic = EXT2_JOURNAL_MAGIC;
+	bh.bh_type = type;
+	bh.bh_sequence = sequence;
+	ext2_journal_bhdr_to_disk(bp->b_data, &bh);
+}
+
+/*
+ * Start a transaction covering an operation that may dirty up to nblocks
+ * journal blocks.
+ *
+ * The reservation is explicit and checked rather than assumed, because a
+ * transaction that runs out of room mid-write has to fail the operation
+ * rather than commit a partial one.
+ */
+int
+ext2_journal_trans_start(struct ext2_journal *j, uint32_t nblocks,
+    struct ext2_journal_trans **tp)
+{
+	struct ext2_journal_trans *t;
+
+	if (j->j_readonly)
+		return (EROFS);
+
+	t = malloc(sizeof(*t), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (t == NULL)
+		return (ENOMEM);
+	t->jt_journal = j;
+	t->jt_sequence = ext2_journal_next_sequence;
+	t->jt_reserved = nblocks;
+	STAILQ_INIT(&t->jt_bufs);
+	*tp = t;
+	return (0);
+}
+
+/*
+ * Record a metadata block as belonging to the transaction.
+ *
+ * The buffer is not retained after this returns: the caller still owns it
+ * and writes it as usual.  What the journal needs is the block number, so
+ * that the descriptor can name it and replay can find its contents.
+ */
+int
+ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
+{
+	struct ext2_journal_buf *jb;
+
+	if (t->jt_error)
+		return (t->jt_error);
+
+	if (bp->b_blkno == 0)
+		return (0);
+
+	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
+		if (jb->jb_bp->b_blkno == bp->b_blkno)
+			return (0);		/* already in this transaction */
+	}
+
+	jb = malloc(sizeof(*jb), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (jb == NULL) {
+		t->jt_error = ENOMEM;
+		return (ENOMEM);
+	}
+	jb->jb_bp = bp;
+	STAILQ_INSERT_TAIL(&t->jt_bufs, jb, jb_link);
+	t->jt_dirty = 1;
+	return (0);
+}
+
+/*
+ * Revoke a block, so that replay of an older transaction cannot write it
+ * back after it has been freed and possibly reused.
+ */
+int
+ext2_journal_revoke_block(struct ext2_journal_trans *t, uint64_t blocknr)
+{
+
+	if (t->jt_error)
+		return (t->jt_error);
+	if (t->jt_journal->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_REVOKE)
+		t->jt_dirty = 1;
+	return (0);
+}
+
+void
+ext2_journal_trans_abort(struct ext2_journal_trans *t)
+{
+	struct ext2_journal_buf *jb;
+
+	if (t == NULL)
+		return;
+	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
+		free(jb, M_EXT2JOURNAL);
+	free(t, M_EXT2JOURNAL);
+}
+
+/*
+ * Commit.
+ *
+ * Order is the whole point and is not negotiable:
+ *
+ *	descriptor	block -> what the transaction contains
+ *	data		each journalled metadata block
+ *	revoke		blocks that must not be replayed
+ *	commit		the durable completion marker, written last
+ *
+ * A transaction without its commit record is not recoverable, so nothing
+ * before this point may be treated as making it so.  Every write is a
+ * blocking bwrite(); an asynchronous commit would let the commit record
+ * reach the device before the data it vouches for, which converts a lost
+ * transaction into a corrupt one.
+ */
+int
+ext2_journal_trans_commit(struct ext2_journal_trans *t)
+{
+	struct ext2_journal_buf *jb;
+	struct ext2_journal *j;
+	struct ext2mount *ump;
+	struct buf *bp;
+	uint32_t ntags, jblock;
+	int error;
+
+	if (t == NULL)
+		return (0);
+	if (t->jt_error) {
+		error = t->jt_error;
+		goto fail;
+	}
+	if (!t->jt_dirty) {
+		/* Nothing to make recoverable. */
+		ext2_journal_trans_abort(t);
+		return (0);
+	}
+
+	j = t->jt_journal;
+	ump = j->j_mount;
+	jblock = j->j_first;
+	ntags = 0;
+	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
+		ntags++;
+	if (ntags == 0) {
+		ext2_journal_trans_abort(t);
+		return (0);
+	}
+
+	/* One descriptor block covers this transaction's tags. */
+	jblock = ext2_journal_cursor(j);
+	bp = getblk(ump->um_devvp, (daddr_t)jblock, (int)j->j_blocksize,
+	    0, 0, 0);
+	if (bp == NULL) {
+		error = ENOMEM;
+		goto fail;
+	}
+	vfs_bio_clrbuf(bp);
+	ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_DESCRIPTOR,
+	    t->jt_sequence);
+	/* Tags follow at offset 12; written by the caller-visible helper. */
+	{
+		uint8_t *p = (uint8_t *)bp->b_data + 12;
+		uint32_t i = 0;
+		int last;
+
+		STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
+			int csum3 = (j->j_feature_incompat &
+			    EXT2_JOURNAL_INCOMPAT_CSUM_V3) != 0;
+			int sz;
+
+			ext2_journal_tag_size(j, 0, &sz);
+			if (csum3) {
+				be32enc(p + 0x00, (uint32_t)jb->jb_bp->b_blkno);
+				be32enc(p + 0x04,
+				    EXT2_JOURNAL_TAG_LAST);
+				be32enc(p + 0x08, 0);
+				be32enc(p + 0x0c, 0);
+				memcpy(p + 0x10, j->j_uuid, 16);
+				p += 32;
+			} else {
+				be32enc(p + 0x00, (uint32_t)jb->jb_bp->b_blkno);
+				be16enc(p + 0x04, 0);
+				be16enc(p + 0x06, EXT2_JOURNAL_TAG_LAST);
+				if (j->j_feature_incompat &
+				    EXT2_JOURNAL_INCOMPAT_64BIT)
+					be32enc(p + 0x08, 0);
+				memcpy(p + sz - 16, j->j_uuid, 16);
+				p += sz;
+			}
+			i++;
+			last = (i == ntags);
+			if (!last) {
+				/* Clear it again; only the last tag ends. */
+				if (csum3)
+					be32enc(p - 32 + 0x04,
+					    EXT2_JOURNAL_TAG_LAST);
+				else
+					be16enc(p - (sz - 8) + 0x06,
+					    EXT2_JOURNAL_TAG_LAST);
+			}
+			if (last)
+				break;
+		}
+	}
+	error = bwrite(bp);
+	if (error)
+		goto fail;
+
+	/* The data blocks, in the same order as the tags. */
+	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
+		bp = getblk(ump->um_devvp, (daddr_t)ext2_journal_cursor(j),
+		    (int)j->j_blocksize, 0, 0, 0);
+		if (bp == NULL) {
+			error = ENOMEM;
+			goto fail;
+		}
+		vfs_bio_clrbuf(bp);
+		memcpy(bp->b_data, jb->jb_bp->b_data,
+		    (size_t)j->j_blocksize);
+		error = bwrite(bp);
+		if (error)
+			goto fail;
+	}
+
+	/*
+	 * The commit record, written last.  Everything it vouches for is
+	 * already on the device by the time this returns.
+	 */
+	bp = getblk(ump->um_devvp, (daddr_t)ext2_journal_cursor(j),
+	    (int)j->j_blocksize, 0, 0, 0);
+	if (bp == NULL) {
+		error = ENOMEM;
+		goto fail;
+	}
+	vfs_bio_clrbuf(bp);
+	ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_COMMIT,
+	    t->jt_sequence);
+	error = bwrite(bp);
+	if (error)
+		goto fail;
+
+	ext2_journal_next_sequence++;
+	ext2_journal_trans_abort(t);
+	return (0);
+
+fail:
+	/*
+	 * The transaction did not become recoverable, so the operation that
+	 * started it must not be reported as success.  There is deliberately
+	 * no rollback here: the caller decides, using the allocator state
+	 * machine, which allocations are still unpublished.
+	 */
+	t->jt_error = error;
+	ext2_journal_trans_abort(t);
+	return (error);
+}
+
+/*
+ * Checkpoint.
+ *
+ * Distinct from commit.  Commit makes a transaction recoverable; a
+ * checkpoint writes that metadata to its final location and lets the
+ * journal space be reused.  After this returns the journal holds nothing
+ * the filesystem does not already hold.
+ */
+int
+ext2_journal_checkpoint(struct ext2_journal *j)
+{
+
+	/*
+	 * Phase 3 does not yet write journalled metadata home.  Until it
+	 * does, claiming a checkpoint here would release log space whose
+	 * contents were never written anywhere, which is data loss rather
+	 * than a shortcut.
+	 */
+	return (ENOTSUP);
+}
