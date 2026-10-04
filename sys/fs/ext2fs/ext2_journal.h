@@ -391,7 +391,19 @@ struct ext2_journal_trans {
 	uint32_t		 jt_used;	/* journal blocks consumed */
 	int			 jt_error;	/* sticky */
 	int			 jt_dirty;	/* metadata seen */
+	int			 jt_revoked;	/* revocations queued */
 	STAILQ_HEAD(, ext2_journal_buf) jt_bufs;
+	STAILQ_HEAD(, ext2_journal_revoke) jt_revokes;
+};
+
+/*
+ * A block this transaction frees.  Replay of this or any earlier
+ * transaction must not write it back, because by the time replay runs
+ * the block may belong to something else entirely.
+ */
+struct ext2_journal_revoke {
+	uint64_t	jr_blocknr;
+	STAILQ_ENTRY(ext2_journal_revoke) jr_link;
 };
 
 struct ext2_journal_buf {
@@ -413,6 +425,13 @@ int	ext2_journal_trans_commit(struct ext2_journal_trans *);
 void	ext2_journal_trans_abort(struct ext2_journal_trans *);
 int	ext2_journal_checkpoint(struct ext2_journal *);
 
+/* Operation scope: the unit of journalling. */
+int	ext2_mount_journal(struct ext2mount *, int ronly);
+void	ext2_unmount_journal(struct ext2mount *);
+int	ext2_op_start(struct inode *, int extent_operation, uint32_t nblocks);
+int	ext2_op_end(struct inode *);
+void	ext2_op_abort(struct inode *);
+
 /* Implemented in ext2_journal_recovery.c. */
 int	ext2_journal_scan(struct ext2_journal *, struct ext2_journal_scan *);
 void	ext2_journal_scan_free(struct ext2_journal_scan *);
@@ -421,3 +440,38 @@ int	ext2_journal_revoked_p(struct ext2_journal_scan *, uint64_t,
 	    uint32_t sequence);
 
 #endif /* !_FS_EXT2FS_EXT2_JOURNAL_H_ */
+
+/*
+ * Operation classification.
+ *
+ * One function decides which consistency mechanism owns an operation.
+ * Inferring it independently in several places is how two mechanisms end
+ * up disagreeing about the same operation, and a disagreement here is
+ * worse than either consistent answer: a partially journaled operation
+ * writes some of its metadata to the log and some of it nowhere.
+ *
+ * The classification follows sys/fs/ext2fs/ext2_journal_mining.md K.
+ */
+enum ext2_op_consistency {
+	EXT2_OP_SU = 0,		/* Soft Updates orders it; no journal needed */
+	EXT2_OP_JOURNAL		/* needs the journal; commit mode undecided */
+};
+
+/*
+ * Classify an operation on an inode.
+ *
+ * Soft Updates covers everything whose metadata is the inode's block
+ * pointers plus at most one parent buffer per level, because that is what
+ * the dependency graph can express.  It has no mechanism for a tree whose
+ * mutation spans several buffers with no parent-child relationship the
+ * graph knows about, which is every extent operation.
+ */
+enum ext2_op_consistency
+ext2_op_classify(struct inode *ip, int extent_operation);
+
+static inline int
+ext2_op_needs_journal(struct inode *ip, int extent_operation)
+{
+
+	return (ext2_op_classify(ip, extent_operation) == EXT2_OP_JOURNAL);
+}

@@ -63,6 +63,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_journal.h>
 #include <fs/ext2fs/ext2_extents.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
@@ -966,13 +967,19 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	ump->um_bptrtodb = le32toh(fs->e2fs->e2fs_log_bsize) + 1;
 	ump->um_seqinc = EXT2_FRAGS_PER_BLOCK(fs);
 	if (ronly == 0)
-		ext2_sbupdate(ump, MNT_WAIT);
-	/*
-	 * Create the dependency graph state.  This has to precede any
-	 * wrapped metadata write, including the recovery below.
-	 */
-	if (ronly == 0)
 		ext2_softdep_mount(ump, fs);
+	/*
+	 * Open the journal and replay it.  This must happen before the
+	 * superblock write below, which clears the clean bit: clearing it
+	 * with an unreplayed journal on the device would tell the next
+	 * mount that nothing needed recovering, and the journal is the only
+	 * record that some of that metadata ever existed.
+	 *
+	 * Read-only mounts skip it and report instead, since replaying
+	 * writes.
+	 */
+	if (ext2_mount_journal(ump, ronly) != 0)
+		goto out;
 	/*
 	 * Reclaim inodes that lost their last link before the system went
 	 * down.  This runs before the filesystem is visible, so that no
@@ -980,6 +987,8 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	 * remove.
 	 */
 	ext2_orphan_recovery(ump);
+	if (ronly == 0)
+		ext2_sbupdate(ump, MNT_WAIT);
 	/*
 	 * Initialize filesystem stat information in mount struct.
 	 */
@@ -1005,6 +1014,7 @@ out:
 	if (cp != NULL)
 		g_vfs_close_unlocked(cp);
 	if (ump) {
+		ext2_unmount_journal(ump);
 		ext2_softdep_unmount(ump);
 		mtx_destroy(EXT2_MTX(ump));
 		free(ump->um_e2fs->e2fs_gd, M_EXT2MNT);
@@ -1054,6 +1064,7 @@ ext2_unmount(struct mount *mp, int mntflags)
 		ext2_sbupdate(ump, MNT_WAIT);
 	}
 
+	ext2_unmount_journal(ump);
 	ext2_softdep_unmount(ump);
 
 	g_vfs_close_unlocked(ump->um_cp);
