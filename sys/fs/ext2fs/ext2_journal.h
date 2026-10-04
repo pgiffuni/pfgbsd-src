@@ -277,6 +277,20 @@ struct ext2_journal {
 	int			 j_readonly;
 	uint32_t		 j_cursor;	/* next log block to write */
 	int			 j_writable;
+	/*
+	 * Blocks that are journalled and committed but not yet written to
+	 * their home locations.  While this list is non-empty the journal
+	 * holds the only copy of that metadata, which is the whole
+	 * difference between a commit and a checkpoint.
+	 */
+	STAILQ_HEAD(, ext2_journal_ckpt) j_ckpt;
+};
+
+struct ext2_journal_ckpt {
+	uint64_t	ck_blocknr;	/* where it belongs */
+	uint32_t	ck_jblock;	/* journal block holding it now */
+	uint32_t	ck_sequence;
+	STAILQ_ENTRY(ext2_journal_ckpt) ck_link;
 };
 
 /* Deserialised, host-endian view of one descriptor tag. */
@@ -425,6 +439,7 @@ int	ext2_journal_revoke_block(struct ext2_journal_trans *, uint64_t);
 int	ext2_journal_trans_commit(struct ext2_journal_trans *);
 void	ext2_journal_trans_abort(struct ext2_journal_trans *);
 int	ext2_journal_checkpoint(struct ext2_journal *);
+int	ext2_journal_checkpoint_if_needed(struct ext2mount *);
 
 /*
  * Ceiling on revocations held by one transaction.
