@@ -477,6 +477,9 @@ void	ext2_journal_destroy(struct ext2_journal *);
 
 int	ext2_journal_trans_start(struct ext2_journal *, uint32_t nblocks,
 	    struct ext2_journal_trans **);
+uint32_t ext2_journal_live(struct ext2_journal *);
+uint32_t ext2_journal_footprint(struct ext2_journal_trans *);
+int	ext2_journal_advance(struct ext2_journal *, uint32_t);
 int	ext2_journal_dirty_metadata(struct ext2_journal_trans *,
 	    struct buf *);
 int	ext2_journal_revoke_block(struct ext2_journal_trans *, uint64_t);
@@ -504,6 +507,33 @@ void	ext2_unmount_journal(struct ext2mount *);
 int	ext2_op_start(struct inode *, int extent_operation, uint32_t nblocks);
 int	ext2_op_end(struct inode *);
 void	ext2_op_abort(struct inode *);
+
+/*
+ * Journal capacity.
+ *
+ * The log is the circular interval [j_first, j_maxlen).  Block 0 holds the
+ * journal superblock and is never a transaction block, so the cursor wraps
+ * to j_first and not to zero, and the usable capacity is the width of
+ * that interval rather than the whole device:
+ *
+ *	capacity = j_maxlen - j_first
+ *
+ * Admission is one inequality, checked before anything is written:
+ *
+ *	live blocks + this transaction's footprint <= capacity
+ *
+ * where "live" is the committed-but-uncheckpointed run from j_start to
+ * the cursor.  A transaction that does not fit is refused whole; there is
+ * no partial write, because a descriptor without its data is worse than a
+ * failed operation.
+ *
+ * This is deliberately not JBD2's credit and semaphore machinery.  Soft
+ * Updates already removes most operations from the journal -- only
+ * extent-mapped inodes reach a transaction -- so the journal has to handle
+ * the largest journal-required operation rather than everything.  One
+ * explicit inequality is enough for that, and it fails loudly.
+ */
+#define	EXT2_JOURNAL_CACITY(j)	((j)->j_maxlen - (j)->j_first)
 
 /* Implemented in ext2_journal_recovery.c. */
 int	ext2_journal_scan(struct ext2_journal *, struct ext2_journal_scan *);
