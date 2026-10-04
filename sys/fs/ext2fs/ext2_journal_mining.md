@@ -737,8 +737,56 @@ disagreeing (§40).
 
 ## L. Interoperability fixtures
 
-Linux is used strictly as a black-box oracle: create images, run workloads,
-read bytes, compare recovery behaviour. No Linux source is read for these.
+### L.0 The constraint that shapes this section
+
+**FreeBSD base carries no e2fsprogs.** `mke2fs`, `debugfs`, `tune2fs` and
+`fsck.ext4` are ports, not base. Base has FreeBSD's own `newfs -t ext2`
+and `fsck_ext2fs`, which are enough to create and check ext2 filesystems
+for the Soft Updates work, and which know nothing about JBD2 or ext4
+extents.
+
+Three consequences, and they are not small:
+
+1. **No fixture can be generated on a FreeBSD machine.** There is no tool
+   that writes a JBD2 journal, and none that dumps journal bytes.
+2. **§B open item 1 — CSUM_V2 versus CSUM_V3 — cannot be settled by
+   generating fixtures on the target.** It needs data produced elsewhere.
+3. **The JBD2 phases are compile-and-debug only.** No journal can be
+   written, read back, replayed or crash-tested against real data during
+   development. Substantive validation happens after the project.
+
+This is accepted, and it is recorded here rather than discovered later,
+because it changes what the implementation must be *like* rather than
+just what it must do.
+
+The mitigation follows from the failure mode. Format code written without
+data to test against must **fail closed**: a wrong assumption has to
+produce a refusal, never a plausible-looking parse. Concretely, that
+means the assertions in §M.3 are mandatory, every field offset is derived
+rather than transcribed, unknown feature bits and unknown tag flags are
+refused rather than ignored (§A.7), and all format knowledge is confined
+to `ext2_inode_cnv.c` so it can be reviewed against the documentation in
+one place without reading the state machine.
+
+§W.1 is the argument. The prior art converts every field's endianness
+correctly and still misplaces three offsets, because nothing asserted
+them. Without fixtures, assertions are the only check available.
+
+### L.1 How fixtures are obtained
+
+Since they cannot be made here, they are brought in:
+
+- generated on a Linux host, where `mke2fs` and `debugfs` exist
+- reduced to the raw journal blocks that matter, not whole images
+- **committed to the repository as binary blobs**, with a manifest
+
+Committing them is what makes the FreeBSD side testable offline, and it
+has the side benefit that the corpus is reviewable: a fixture is evidence
+that can be diffed, not a file that has to be regenerated to be believed.
+A CI job on Linux can regenerate and verify them; a FreeBSD build
+consumes them.
+
+### L.2 Required fixtures
 
 Required JBD2 fixtures, each recorded with byte offsets, endian
 representation, sequence numbers, checksums, feature flags, and expected
@@ -1034,7 +1082,7 @@ not assumed.
 
 | # | Item | Why it is open |
 |---|---|---|
-| 1 | CSUM_V2 or CSUM_V3 as the written feature | decidable only from fixtures, §B |
+| 1 | CSUM_V2 or CSUM_V3 as the written feature | **now blocked by §L.0.** Was "decidable from fixtures"; fixtures cannot be generated on FreeBSD. Needs Linux-produced journal data, or an explicit decision to write neither and require the reader to accept both. Note the prior art's hardcoded 8-byte tag (§W.1) is the shape of this mistake. |
 | 2 | `EXT2F_INCOMPAT_SUPP` widening for `JOURNAL_DEV` | must not precede a working reader, §A.4.1 |
 | 3 | `EXT2F_COMPAT_HASJOURNAL` currently untested | mount must either honour or reject, §A.4.2 |
 | 4 | Journal lock position | proposed in §M.5, unverified |
@@ -1042,6 +1090,8 @@ not assumed.
 | 6 | Read-only→read-write recovery hook | §M.7 |
 | 7 | `ext2_alloc_meta()` lock asymmetry | §M.5, affects serialisation assumptions |
 | 8 | which of `ext2_update`/`ext2_blkfree`/`ext2_alloccg`/`ext2_nodealloccg`/`ext2_vfree` the journal must hook | §J.4 |
+| 9 | a Linux host to produce the §L fixture corpus on | §L.0; without it open item 1 stays open and no journal byte is ever validated |
+| 10 | whether to commit reduced journal blobs, or whole images | §L.1; blobs are reviewable and cheap, images are self-contained |
 
 ---
 
