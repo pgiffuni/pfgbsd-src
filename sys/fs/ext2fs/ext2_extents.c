@@ -916,6 +916,15 @@ ext4_ext_alloc_meta(struct inode *ip)
 	return (blk);
 }
 
+/*
+ * Free 'count' extent blocks, revoking them if a transaction is open.
+ *
+ * This and ext4_remove_blocks() are the only places extent blocks are
+ * released, so revoking here covers tree nodes and data blocks alike.
+ * Doing it at the free rather than at each caller is deliberate: a block
+ * freed without a revocation can be replayed over whatever now owns it,
+ * and callers that forget are exactly the case revocation guards.
+ */
 static void
 ext4_ext_blkfree(struct inode *ip, uint64_t blk, int count, int flags)
 {
@@ -924,6 +933,16 @@ ext4_ext_blkfree(struct inode *ip, uint64_t blk, int count, int flags)
 
 	fs = ip->i_e2fs;
 	blocksreleased = count;
+
+	if (ip->i_ump->um_jtrans != NULL) {
+		for (i = 0; i < count; i++) {
+			if (ext2_journal_revoke_block(ip->i_ump->um_jtrans,
+			    blk + i) != 0) {
+				ip->i_ump->um_jtrans->jt_error = ENOSPC;
+				break;
+			}
+		}
+	}
 
 	for(i = 0; i < count; i++)
 		ext2_blkfree(ip, blk + i, fs->e2fs_bsize);
@@ -1556,15 +1575,29 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 	allocated = max_blocks;
 	newblk = ext4_new_blocks(ip, iblk, bpref, cred, &allocated, &error,
 	    &ctx);
-	if (!newblk)
+	if (!newblk) {
+		ext2_op_abort(ip);
 		goto out2;
+	}
 
 	/* Try to insert new extent into found leaf and return. */
 	newex.e_blk = htole32(iblk);
 	ext4_ext_store_pblock(&newex, newblk);
 	newex.e_len = htole16(allocated);
+	/*
+	 * One operation: allocate the blocks, install the extent that names
+	 * them, and record the charge against the inode.  Journalling the
+	 * extent alone would let a crash between the allocation and the
+	 * insert leave blocks reserved but unreferenced, or an extent
+	 * naming blocks whose bitmap reservation never reached the disk.
+	 */
+	error = ext2_op_start(ip, 1, 64);
+	if (error)
+		goto out2;
+
 	error = ext4_ext_insert_extent(ip, path, &newex, &ctx);
 	if (error) {
+		ext2_op_abort(ip);
 		/*
 		 * No extent record reached the disk, so the run is
 		 * unpublished and can simply be given back.
@@ -1584,6 +1617,17 @@ ext4_ext_get_blocks(struct inode *ip, e4fs_daddr_t iblk,
 	newblk = ext4_ext_extent_pblock(&newex);
 	ext4_ext_put_in_cache(ip, iblk, allocated, newblk, EXT4_EXT_CACHE_IN);
 	*pallocated = 1;
+
+	/*
+	 * Commit before the caller is told the blocks are its own.  The
+	 * extent is on disk but only the commit record makes the whole
+	 * operation recoverable; reporting success before it would let a
+	 * crash leave an extent naming blocks nothing accounts for.
+	 */
+	if (ext2_op_end(ip) != 0) {
+		ext2_rollback_allocation(&ctx);
+		goto out2;
+	}
 
 out:
 	/* The run may be longer than the caller asked for. */

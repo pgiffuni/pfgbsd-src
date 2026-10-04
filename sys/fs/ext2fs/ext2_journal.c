@@ -681,6 +681,11 @@ ext2_journal_revoke_block(struct ext2_journal_trans *t, uint64_t blocknr)
 	if (!(t->jt_journal->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_REVOKE))
 		return (ENOTSUP);
 
+	if (t->jt_nrevoked >= EXT2_JOURNAL_MAX_REVOKES) {
+		t->jt_error = ENOSPC;
+		return (ENOSPC);
+	}
+
 	STAILQ_FOREACH(rv, &t->jt_revokes, jr_link) {
 		if (rv->jr_blocknr == blocknr)
 			return (0);
@@ -692,6 +697,7 @@ ext2_journal_revoke_block(struct ext2_journal_trans *t, uint64_t blocknr)
 	}
 	rv->jr_blocknr = blocknr;
 	STAILQ_INSERT_TAIL(&t->jt_revokes, rv, jr_link);
+	t->jt_nrevoked++;
 	t->jt_revoked = 1;
 	t->jt_dirty = 1;
 	return (0);
@@ -1077,18 +1083,20 @@ ext2_op_start(struct inode *ip, int extent_operation, uint32_t nblocks)
 		return (0);
 	if (ump->um_jtrans != NULL) {
 		/*
-		 * A transaction is already open for this operation.  Nesting
-		 * would mean the inner commit could not make the outer
-		 * operation recoverable, so it is refused rather than
-		 * silently merged.
+		 * Already inside a transaction for an enclosing operation.
+		 * The inner work joins it: a nested transaction could not be
+		 * committed on its own without making the outer operation
+		 * recoverable in two halves.
 		 */
-		return (EINVAL);
+		ump->um_jtrans_depth++;
+		return (0);
 	}
 
 	error = ext2_journal_trans_start(ump->um_journal, nblocks, &t);
 	if (error)
 		return (error);
 	ump->um_jtrans = t;
+	ump->um_jtrans_depth = 1;
 	return (0);
 }
 
@@ -1109,7 +1117,13 @@ ext2_op_end(struct inode *ip)
 
 	if (t == NULL)
 		return (0);
+	if (ump->um_jtrans_depth > 1) {
+		/* Inner scope; the outermost commit is what counts. */
+		ump->um_jtrans_depth--;
+		return (0);
+	}
 	ump->um_jtrans = NULL;
+	ump->um_jtrans_depth = 0;
 	error = ext2_journal_trans_commit(t);
 	return (error);
 }
@@ -1122,7 +1136,20 @@ ext2_op_abort(struct inode *ip)
 
 	if (t == NULL)
 		return;
+	if (ump->um_jtrans_depth > 1) {
+		/*
+		 * An inner failure does not unwind the outer transaction,
+		 * but it does poison it: the outer operation still has to
+		 * fail, because part of its metadata was written by a step
+		 * that failed.
+		 */
+		ump->um_jtrans_depth--;
+		if (t->jt_error == 0)
+			t->jt_error = EIO;
+		return;
+	}
 	ump->um_jtrans = NULL;
+	ump->um_jtrans_depth = 0;
 	ext2_journal_trans_abort(t);
 }
 
