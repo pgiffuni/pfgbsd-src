@@ -302,6 +302,15 @@ struct ext2_journal {
 	uint32_t		 j_blocksize;
 	uint32_t		 j_maxlen;
 	uint32_t		 j_first;
+	/*
+	 * First block of the log that is still needed: everything before it
+	 * has been checkpointed to its home location and can be reclaimed.
+	 * This is what s_start records on disk.
+	 */
+	uint32_t		 j_start;
+	uint32_t		 j_sequence;	/* s_sequence, for superblock
+						 * validity */
+	uint32_t		 j_reclaim;	/* below here is reclaimable */
 	uint32_t		 j_nr_users;
 	uint8_t			 j_uuid[16];
 	uint32_t		 j_feature_compat;
@@ -474,6 +483,7 @@ int	ext2_journal_revoke_block(struct ext2_journal_trans *, uint64_t);
 int	ext2_journal_trans_commit(struct ext2_journal_trans *);
 void	ext2_journal_trans_abort(struct ext2_journal_trans *);
 int	ext2_journal_checkpoint(struct ext2_journal *);
+int	ext2_journal_write_sb(struct ext2_journal *);
 int	ext2_journal_checkpoint_if_needed(struct ext2mount *);
 
 /*

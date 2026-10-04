@@ -426,6 +426,8 @@ ext2_journal_sb_from_disk(const void *buf, struct ext2_journal *j)
 	j->j_blocksize = be32toh(disk.sb_blocksize);
 	j->j_maxlen = be32toh(disk.sb_maxlen);
 	j->j_first = be32toh(disk.sb_first);
+	j->j_start = be32toh(disk.sb_start);
+	j->j_sequence = be32toh(disk.sb_sequence);
 	memcpy(j->j_uuid, disk.sb_uuid, sizeof(j->j_uuid));
 
 	/*
@@ -455,6 +457,9 @@ ext2_journal_sb_to_disk(void *buf, const struct ext2_journal *j)
 	disk.sb_blocksize = htobe32(j->j_blocksize);
 	disk.sb_maxlen = htobe32(j->j_maxlen);
 	disk.sb_first = htobe32(j->j_first);
+	disk.sb_start = htobe32(j->j_start);
+	disk.sb_sequence = htobe32(j->j_sequence);
+	disk.sb_errno = htobe32(0);
 
-	memcpy(buf, &disk, sizeof(disk));
+	memcpy(buf, &disk, EXT2_JOURNAL_SB_SIZE);
 }
