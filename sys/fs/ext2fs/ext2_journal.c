@@ -751,18 +751,26 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	{
 		uint8_t *p = (uint8_t *)bp->b_data + 12;
 		uint32_t i = 0;
-		int last;
+		int csum3 = (j->j_feature_incompat &
+		    EXT2_JOURNAL_INCOMPAT_CSUM_V3) != 0;
+		int sz;
+
+		ext2_journal_tag_size(j, 0, &sz);
 
 		STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
-			int csum3 = (j->j_feature_incompat &
-			    EXT2_JOURNAL_INCOMPAT_CSUM_V3) != 0;
-			int sz;
+			uint32_t flags;
 
-			ext2_journal_tag_size(j, 0, &sz);
+			i++;
+			/*
+			 * LAST_TAG belongs on the final tag only.  Setting
+			 * it on every tag would tell a reader the array
+			 * ends after the first entry.
+			 */
+			flags = (i == ntags) ? EXT2_JOURNAL_TAG_LAST : 0;
+
 			if (csum3) {
 				be32enc(p + 0x00, (uint32_t)jb->jb_bp->b_blkno);
-				be32enc(p + 0x04,
-				    EXT2_JOURNAL_TAG_LAST);
+				be32enc(p + 0x04, flags);
 				be32enc(p + 0x08, 0);
 				be32enc(p + 0x0c, 0);
 				memcpy(p + 0x10, j->j_uuid, 16);
@@ -770,28 +778,16 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 			} else {
 				be32enc(p + 0x00, (uint32_t)jb->jb_bp->b_blkno);
 				be16enc(p + 0x04, 0);
-				be16enc(p + 0x06, EXT2_JOURNAL_TAG_LAST);
+				be16enc(p + 0x06, (uint16_t)flags);
 				if (j->j_feature_incompat &
 				    EXT2_JOURNAL_INCOMPAT_64BIT)
 					be32enc(p + 0x08, 0);
 				memcpy(p + sz - 16, j->j_uuid, 16);
 				p += sz;
 			}
-			i++;
-			last = (i == ntags);
-			if (!last) {
-				/* Clear it again; only the last tag ends. */
-				if (csum3)
-					be32enc(p - 32 + 0x04,
-					    EXT2_JOURNAL_TAG_LAST);
-				else
-					be16enc(p - (sz - 8) + 0x06,
-					    EXT2_JOURNAL_TAG_LAST);
-			}
-			if (last)
-				break;
 		}
 	}
+
 	error = bwrite(bp);
 	if (error)
 		goto fail;
@@ -864,4 +860,96 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 	 * than a shortcut.
 	 */
 	return (ENOTSUP);
+}
+
+/*
+ * Journal lifecycle.
+ *
+ * Opening a journal reads the superblock from the journal device and
+ * refuses anything whose feature set cannot be read.  Creating one writes
+ * a fresh superblock; it is not reached in this phase, and is here so
+ * the reader has a counterpart to be tested against rather than only
+ * something that can parse.
+ */
+int
+ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
+    struct ext2_journal **jp)
+{
+	struct ext2_journal *j;
+	struct buf *bp;
+	uint32_t unsupported;
+	int error;
+
+	*jp = NULL;
+
+	/*
+	 * The journal inode number comes from the filesystem superblock.
+	 * Reading it is not this function's job: the journal superblock
+	 * lives at the start of the journal device, and the two are
+	 * cross-checked by UUID below.
+	 */
+	if (fs->e2fs->e3fs_journal_inum == 0)
+		return (ENOENT);
+
+	j = malloc(sizeof(*j), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (j == NULL)
+		return (ENOMEM);
+	j->j_mount = ump;
+	j->j_fs = fs;
+	j->j_sb = malloc(EXT2_JOURNAL_SB_SIZE, M_EXT2JOURNAL,
+	    M_WAITOK | M_ZERO);
+	if (j->j_sb == NULL) {
+		free(j, M_EXT2JOURNAL);
+		return (ENOMEM);
+	}
+
+	/* Read as raw bytes and convert field by field; never cast. */
+	bp = getblk(ump->um_devvp, 0, (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
+	if (bp == NULL) {
+		free(j->j_sb, M_EXT2JOURNAL);
+		free(j, M_EXT2JOURNAL);
+		return (ENOMEM);
+	}
+	memcpy(j->j_sb, bp->b_data, EXT2_JOURNAL_SB_SIZE);
+	brelse(bp);
+
+	ext2_journal_sb_from_disk(j->j_sb, j);
+
+	error = ext2_journal_features_ok(j->j_feature_compat,
+	    j->j_feature_incompat, j->j_feature_ro_compat, &unsupported);
+	if (error)
+		goto fail;
+
+	/*
+	 * The journal UUID must match the copy in the filesystem
+	 * superblock.  A mismatch means the two describe different logs,
+	 * and replaying one onto the other would be worse than not
+	 * replaying at all.
+	 */
+	if (memcmp(j->j_uuid, fs->e2fs->e3fs_journal_uuid,
+	    sizeof(j->j_uuid)) != 0) {
+		error = EINVAL;
+		goto fail;
+	}
+
+	j->j_cursor = j->j_first;
+	mtx_init(&j->j_lock, "ext2fs journal", MTX_DEF, 0);
+	*jp = j;
+	return (0);
+
+fail:
+	free(j->j_sb, M_EXT2JOURNAL);
+	free(j, M_EXT2JOURNAL);
+	return (error);
+}
+
+void
+ext2_journal_destroy(struct ext2_journal *j)
+{
+
+	if (j == NULL)
+		return;
+	mtx_destroy(&j->j_lock);
+	free(j->j_sb, M_EXT2JOURNAL);
+	free(j, M_EXT2JOURNAL);
 }
