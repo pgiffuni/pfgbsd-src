@@ -52,7 +52,6 @@
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_softdep.h>
-#include <fs/ext2fs/ext2_softdep.h>
 #include <fs/ext2fs/ext2_mount.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);

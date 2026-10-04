@@ -574,25 +574,35 @@ The rename example is internally consistent: 12 + 16 + 16 + 136 + 12 =
 for tags it sizes as 12 + 20 + 136 + 12, which sums to 180; either
 ADD_RANGE is 8 there or the paper is inconsistent. Not resolved.
 
-### F.3 A conflict between the two sources
+### F.3 A conflict between the two sources, and which wins
 
 They disagree on the tag set.
 
-| | kernel `journal.rst` §3.6.9 | FASTCOMMIT paper |
+| | kernel `journal.rst` §3.6.9 | FASTCOMMIT paper (2024) |
 |---|---|---|
 | tags | HEAD, ADD_RANGE, DEL_RANGE, CREAT, LINK, UNLINK, **PAD**, TAIL | HEAD, ADD_RANGE, DEL_RANGE, CREAT, LINK, UNLINK, **INODE**, TAIL |
 
-The paper has INODE where the documentation has PAD, and the paper's own
-worked examples all rely on INODE. Neither source gives the numeric values
-of the tags, so the ordering that would put INODE at 7 is inference from
-list order, not from either source.
+**The kernel documentation wins.** The paper is a design snapshot from
+2024 describing the implementation as it stood then; the documentation
+describes what a current implementation writes. Interoperability is with
+the current kernel, not with the paper's example, so where they differ
+the documentation is the authority.
 
-**This means the numbering already implemented here is unverified.** It was
-taken from the documentation's list order with PAD assumed at 7; if INODE
-occupies 7, the current `EXT2_FC_TAG_PAD` is wrong, and an area written
-by a real implementation would be refused by the reader. The reader
-failing closed is the right behaviour for an unknown tag, so the failure
-is safe — but it would be a false refusal, not a correct parse.
+Two consequences:
+
+- `EXT2_FC_TAG_PAD` is restored. Removing it earlier was wrong: the
+  documentation does name PAD, as a tag with no value struct covering
+  "unused area" in the fast commit area. The reasoning that no source
+  established it was mistaken — one does, and it is the one that counts.
+- The paper's INODE remains unexplained. It may be a tag the documentation
+  does not list, or one that replaced PAD, or a name the documentation
+  renders differently. Its numeric value is not knowable from either
+  source, so nothing is assigned to it and an area containing one is
+  refused rather than misparsed.
+
+Neither source gives numeric tag values, so the values in the header remain
+list order — an assumption, and marked as one. It is safe to read against
+because an unknown tag is refused; it is not safe to write against.
 
 ### F.4 Still unspecified
 
