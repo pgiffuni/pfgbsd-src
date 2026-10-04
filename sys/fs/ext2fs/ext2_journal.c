@@ -970,6 +970,55 @@ ext2_journal_seal(struct ext2_journal *j, struct buf *bp, size_t tailoff,
 	be32enc((uint8_t *)bp->b_data + tailoff, csum);
 }
 
+static size_t need_rev_entry_offset(const struct ext2_journal *);
+static int ext2_journal_first_block(struct ext2mount *, struct m_ext2fs *,
+	    e4fs_daddr_t *);
+
+/*
+ * Revoke block helpers.  The entries and the header are written through
+ * the asserted structures, and r_count is the byte count the format
+ * defines -- header, entries and any checksum tail -- not an entry count.
+ */
+static void
+ext2_journal_revokes_reset(struct ext2_journal *j, struct buf *bp)
+{
+	struct ext2fs_journal_revoke_hdr rh;
+
+	memset(&rh, 0, sizeof(rh));
+	rh.rh_count = 0;
+	memcpy(bp->b_data, &rh, sizeof(rh));
+}
+
+static void
+ext2_journal_revoke_add_raw(struct ext2_journal *j, struct buf *bp,
+    size_t at, uint64_t blocknr)
+{
+	int wide = (j->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_64BIT) != 0;
+
+	if (wide)
+		be64enc((uint8_t *)bp->b_data + at, blocknr);
+	else
+		be32enc((uint8_t *)bp->b_data + at, (uint32_t)blocknr);
+}
+
+static void
+ext2_journal_seal_revoke(struct ext2_journal *j, struct buf *bp, uint32_t count)
+{
+	struct ext2fs_journal_revoke_hdr *rh =
+	    (struct ext2fs_journal_revoke_hdr *)bp->b_data;
+
+	rh->rh_count = htobe32(count);
+	ext2_journal_seal(j, bp, bp->b_bufsize - 4, 1);
+}
+
+/* Where the first revoke entry sits, from the asserted header layout. */
+static size_t
+need_rev_entry_offset(const struct ext2_journal *j)
+{
+	(void)j;
+	return (16);		/* common header (12) plus r_count (4) */
+}
+
 /*
  * Commit.
  *
@@ -1159,45 +1208,61 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	if (t->jt_revoked) {
 		int wide = (j->j_feature_incompat &
 		    EXT2_JOURNAL_INCOMPAT_64BIT) != 0;
-		uint8_t *p;
-		uint32_t count = 0;
+		uint32_t per = ext2_journal_revokes_per_block(j);
+		uint32_t inblock = 0;
+		uint32_t count;
+		size_t at = need_rev_entry_offset(j);
+		size_t width = wide ? 8 : 4;
 
-		bp = getblk(ump->um_devvp, (daddr_t)ext2_journal_cursor(j),
-		    (int)j->j_blocksize, 0, 0, 0);
-		if (bp == NULL) {
-			error = ENOMEM;
+		if (per == 0) {
+			error = EINVAL;
 			goto fail;
 		}
-		vfs_bio_clrbuf(bp);
-		ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_REVOKE,
-		    t->jt_sequence);
 
-		p = (uint8_t *)bp->b_data + 0x0c;
-		STAILQ_FOREACH(jr, &t->jt_revokes, jr_link) {
-			if (wide)
-				be64enc(p, jr->jr_blocknr);
-			else
-				be32enc(p, (uint32_t)jr->jr_blocknr);
-			p += wide ? 8 : 4;
-			count += wide ? 8 : 4;
-		}
 		/*
-		 * r_count is the number of bytes this block uses, including
-		 * the header and any tail -- not the number of entries.
-		 * Storing an entry count here is the single easiest way to
-		 * make a revoke list mean something else entirely.
+		 * As many revoke blocks as the revocations need.  Emitting
+		 * only one and dropping the remainder is worse than not
+		 * revoking at all: the blocks that were dropped are freed,
+		 * may be reused, and then have an older transaction that
+		 * wrote them replayed over their new owner.
 		 */
-		count += 0x10;		/* header plus r_count itself */
+		STAILQ_FOREACH(jr, &t->jt_revokes, jr_link) {
+			if (inblock == per) {
+				/* finish the block already being built */
+				count = 0x10 + wide * inblock;
+				if (ext2_journal_csum_blocks(j))
+					count += 4;
+				ext2_journal_seal_revoke(j, bp, count);
+				error = bwrite(bp);
+				if (error)
+					goto fail;
+				EXT2_CRASH(EXT2_CRASH_REVOKE_WRITE);
+
+				bp = getblk(ump->um_devvp,
+				    (daddr_t)ext2_journal_cursor(j),
+				    (int)j->j_blocksize, 0, 0, 0);
+				if (bp == NULL) {
+					error = ENOMEM;
+					goto fail;
+				}
+				vfs_bio_clrbuf(bp);
+				ext2_journal_write_bhdr(bp,
+				    EXT2_JOURNAL_BT_REVOKE, t->jt_sequence);
+				ext2_journal_revokes_reset(j, bp);
+				inblock = 0;
+				at = need_rev_entry_offset(j);
+			}
+			ext2_journal_revoke_add_raw(j, bp, at,
+			    jr->jr_blocknr);
+			at += width;
+			inblock++;
+		}
+
+		/* the block still being built */
+		count = 0x10 + wide * inblock;
 		if (ext2_journal_csum_blocks(j))
 			count += 4;
-		{
-			struct ext2fs_journal_revoke_hdr *rh =
-			    (struct ext2fs_journal_revoke_hdr *)bp->b_data;
-
-			rh->rh_count = htobe32(count);
-		}
-
-		ext2_journal_seal(j, bp, bp->b_bufsize - 4, 1);
+		ext2_journal_seal_revoke(j, bp, count);
 		error = bwrite(bp);
 		if (error)
 			goto fail;
@@ -1369,19 +1434,34 @@ ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
 {
 	struct ext2_journal *j;
 	struct buf *bp;
+	e4fs_daddr_t sbphys = 0;
 	uint32_t unsupported;
+	int fsbtodb = 0;
 	int error;
 
 	*jp = NULL;
 
 	/*
-	 * The journal inode number comes from the filesystem superblock.
-	 * Reading it is not this function's job: the journal superblock
-	 * lives at the start of the journal device, and the two are
-	 * cross-checked by UUID below.
+	 * An internal journal's superblock is the first block of the
+	 * journal inode's data -- not block 0 of the filesystem device.
+	 * Block 0 holds the filesystem superblock, and that is a real
+	 * hazard rather than a theoretical one: the ext2 superblock magic
+	 * and the JBD2 superblock magic are both 0xEF53, so reading the
+	 * wrong block would pass the magic check and then parse an
+	 * entirely unrelated structure.
+	 *
+	 * A journal on a separate device is not supported; the superblock
+	 * carries that in an incompat feature which is refused at mount, so
+	 * reaching here always means an internal journal.
 	 */
 	if (fs->e2fs->e3fs_journal_inum == 0)
 		return (ENOENT);
+
+	sbphys = 0;
+	error = ext2_journal_first_block(ump, fs, &sbphys);
+	if (error)
+		return (error);
+	fsbtodb = (int)fsbtodb(fs, sbphys);
 
 	j = malloc(sizeof(*j), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
 	if (j == NULL)
@@ -1396,7 +1476,8 @@ ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
 	}
 
 	/* Read as raw bytes and convert field by field; never cast. */
-	bp = getblk(ump->um_devvp, 0, (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
+	bp = getblk(ump->um_devvp, (daddr_t)fsbtodb,
+	    (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
 	if (bp == NULL) {
 		free(j->j_sb, M_EXT2JOURNAL);
 		free(j, M_EXT2JOURNAL);
@@ -1627,6 +1708,35 @@ ext2_journal_write_sb(struct ext2_journal *j)
 	free(sb, M_EXT2JOURNAL);
 	EXT2_CRASH(EXT2_CRASH_SB_UPDATE);
 	return (error);
+}
+
+/*
+ * Find the first physical block of the journal inode's data.
+ *
+ * Through the journal inode rather than by assuming a device offset: the
+ * journal is a file, and where its first block lands depends on the
+ * filesystem's own allocation.
+ */
+static int
+ext2_journal_first_block(struct ext2mount *ump, struct m_ext2fs *fs,
+    e4fs_daddr_t *physp)
+{
+	struct vnode *vp;
+	daddr_t phys = 0;
+	int error;
+
+	error = ext2_vget(ump->um_mountp, fs->e2fs->e3fs_journal_inum,
+	    LK_EXCLUSIVE, &vp);
+	if (error)
+		return (error);
+
+	error = ext2_bmaparray(vp, 0, &phys, NULL, NULL);
+	vput(vp);
+	if (error)
+		return (error);
+
+	*physp = fsbtodb(fs, phys);
+	return (0);
 }
 
 /*

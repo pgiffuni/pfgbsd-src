@@ -84,7 +84,7 @@ static vfs_unmount_t		ext2_unmount;
 static vfs_root_t		ext2_root;
 static vfs_statfs_t		ext2_statfs;
 static vfs_sync_t		ext2_sync;
-static vfs_vget_t		ext2_vget;
+vfs_vget_t			ext2_vget;
 static vfs_fhtovp_t		ext2_fhtovp;
 static vfs_mount_t		ext2_mount;
 
@@ -1240,7 +1240,7 @@ loop:
  * return the inode locked.  Detection and handling of mount points must be
  * done by the calling routine.
  */
-static int
+int
 ext2_vget(struct mount *mp, ino_t ino, int flags, struct vnode **vpp)
 {
 	struct m_ext2fs *fs;
