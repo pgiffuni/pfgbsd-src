@@ -326,6 +326,14 @@ things.
 | What | Coverage | Field zeroed during computation |
 |---|---|---|
 | journal superblock | the entire 1024-byte structure, **no UUID** | `s_checksum` at 0xFC |
+
+An internal journal's superblock is the first block of the **journal
+inode's data**, not block 0 of the filesystem device. That is not a
+theoretical concern: the ext2 superblock magic and the JBD2 superblock
+magic are both `0xEF53`, so reading the wrong block passes the magic
+check and then parses an unrelated structure as a journal. Verified
+against a real image: the journal inode was 8, its extent began at
+physical block 16385, and device block 0 was the filesystem superblock.
 | descriptor block tail | journal UUID + the descriptor block | `t_checksum` |
 | data block tag (classic) | journal UUID + sequence number + the data block — **low 16 bits stored** | n/a |
 | data block tag (CSUM_V3) | journal UUID + sequence number + the data block — full 32 bits | n/a |
@@ -350,6 +358,21 @@ sb_csum = calculate_crc32c(0, sb, 1024) ^ 0xFFFFFFFF
 No UUID is mixed in. The superblock already carries it at 0x30, so
 seeding with it would cover those bytes twice. The descriptor, data,
 revoke and commit checksums do take the UUID; the superblock does not.
+All four rules were established against real journal blocks rather than
+inferred:
+
+| covers | rule | verified value |
+|---|---|---|
+| superblock | `crc32c(block)`, no UUID | `0xb3dbf602` |
+| descriptor tail | `crc32c(uuid || block)`, tail zeroed | `0x5bee888e` |
+| commit | `crc32c(uuid || block)`, first word zeroed | `0xb60191c2` |
+| data tag | `crc32c(uuid || be32(seq) || block)` | 21 of 21 tags |
+
+The primitive is xor on entry and none on exit. `sys/crc32c.c` is absent
+from this tree, so `calculate_crc32c()`'s chaining could only be
+inferred; the implementation is therefore local rather than relying on a
+function it cannot read.
+
 This is exactly the kind of detail that documentation alone does not
 settle, and it was wrong here until a real superblock was checked.
 
