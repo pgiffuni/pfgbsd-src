@@ -330,13 +330,27 @@ _Static_assert(sizeof(struct ext2fs_journal_commit) >= 0x3c,
  * one is not, and this filesystem does not guess at a format it cannot
  * read.
  */
+/*
+ * The tag/length header widths are confirmed by the FASTCOMMIT paper
+ * (USENIX ATC '24), which states type is two bytes and length is two
+ * bytes.
+ *
+ * The numeric values below are NOT.  Neither the kernel documentation
+ * nor the paper gives them, and the two disagree about the tag set: the
+ * documentation lists PAD where the paper lists INODE, and the paper's
+ * examples all rely on INODE.  These values are list order, which is an
+ * assumption.
+ *
+ * It is a safe one to read against, because an unknown tag is refused
+ * rather than skipped.  It is not a safe one to WRITE against.
+ */
 #define	EXT2_FC_TAG_HEAD		1
 #define	EXT2_FC_TAG_ADD_RANGE	2
 #define	EXT2_FC_TAG_DEL_RANGE	3
 #define	EXT2_FC_TAG_CREAT	4
 #define	EXT2_FC_TAG_LINK		5
 #define	EXT2_FC_TAG_UNLINK	6
-#define	EXT2_FC_TAG_PAD		7
+#define	EXT2_FC_TAG_INODE	7	/* named PAD by the kernel docs */
 #define	EXT2_FC_TAG_TAIL		8
 #define	EXT2_FC_TAG_MIN		EXT2_FC_TAG_HEAD
 #define	EXT2_FC_TAG_MAX		EXT2_FC_TAG_TAIL
@@ -346,7 +360,7 @@ struct ext2_fc_scan {
 	uint32_t	fcs_records;
 	uint32_t	fcs_bytes;	/* consumed, including the last field */
 	int		fcs_tail;	/* a TAIL terminated the area */
-	int		fcs_pad;	/* trailing PAD seen */
+
 };
 
 int	ext2_fc_scan(const void *, size_t, struct ext2_fc_scan *);
