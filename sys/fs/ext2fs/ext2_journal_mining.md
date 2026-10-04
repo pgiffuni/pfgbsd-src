@@ -532,66 +532,90 @@ reasoning, the failure it prevents, and the exact transformation. Design
 work — what a fast commit must contain, when it is legal, and what
 recovery must enforce — can be done entirely from this text.
 
-### F.2 Documented, but only by derivation
+### F.2 A second, non-GPL source: the FASTCOMMIT paper
 
-| Item | Basis | Confidence |
+Shirwadkar, Kadekodi and Tso, *"FASTCOMMIT: resource-efficient,
+performant and cost-effective filesystem journaling"*, USENIX ATC '24
+(`https://www.usenix.org/system/files/atc24-shirwadkar.pdf`). This is the
+design paper for the feature, by the authors who implemented it in ext4.
+It is a published paper, not GPL source, so it is a legitimate provenance
+source under §1.
+
+It **resolves the one structural assumption** this record previously had
+to flag as inference:
+
+> Each FC Tag has three fields - (1) type: 2 bytes (short int) (2) length
+> (short int): 2 bytes and (3) value: variable length
+
+Two 16-bit fields, exactly as derived. That assumption is no longer
+inference.
+
+It also answers a question the kernel documentation leaves open —
+**where the fast commit area is**:
+
+> Multiple FC Logs are written to FASTCOMMIT area, which is next to the
+> JBD2 area on disk.
+
+And it gives concrete sizes, from two worked examples:
+
+| Tag | Bytes | Contents per the paper |
 |---|---|---|
-| Big-endian | "All fields in jbd2 are written to disk in big-endian order", and the fast commit area is part of the journal | high, stated for the journal as a whole |
-| TID is 32 bits | transaction sequences are `__be32` in the block header at 0x8 | high, inferred from a documented field's type |
-| `ext4_fc_tl` is 4 bytes | "stores the tag and the length of the entire field" — two 16-bit fields is the only encoding consistent with eight tags and lengths up to a block | **moderate; this is inference, not documentation** |
+| HEAD | 12 | "the commitID of the previous slow commit after which this FCLog should be replayed" |
+| ADD_RANGE | 20 | "a new extent with logical block address 1, physical block address 1000, and size 1 block was added to the file" |
+| DEL_RANGE | not given | "only stores the extents that were removed from the file using the DEL_RANGE tag" |
+| CREAT | not given | "a new inode has been allocated, and added to a parent directory based on the file path" |
+| LINK | 16 | "records the association of \"bar\" with i10" |
+| UNLINK | 16 | "records the disassociation of the directory entry \"foo\" from i10" |
+| INODE | 136 | "the most recent copy of the file's inode" |
+| TAIL | 12 | "the checksum of the entire FCLog" |
 
-The third is the only structural assumption, and it is the one the whole
-parser would rest on. It is plausible and self-consistent, but "plausible
-and self-consistent" is not the standard the rest of this document holds
-itself to.
+The rename example is internally consistent: 12 + 16 + 16 + 136 + 12 =
+192, which is the total the paper states. The append example states 168
+for tags it sizes as 12 + 20 + 136 + 12, which sums to 180; either
+ADD_RANGE is 8 there or the paper is inconsistent. Not resolved.
 
-### F.3 Not specified anywhere in the documentation
+### F.3 A conflict between the two sources
 
-Nothing at all is given for the five value structures beyond their names
-and one-line descriptions:
+They disagree on the tag set.
 
-| Structure | What §3.6.9 says | What is missing |
+| | kernel `journal.rst` §3.6.9 | FASTCOMMIT paper |
 |---|---|---|
-| `ext4_fc_head` | "the TID of the transaction after which these fast commits should be applied" | field widths, whether a checksum is present, padding, endian |
-| `ext4_fc_add_range` | "the inode number and extent to be added in this inode" | inode width; whether "extent" is the documented ext4 extent leaf record reused verbatim, and if so which variant; range length field |
-| `ext4_fc_del_range` | "the inode number and the logical offset range" | both widths, whether length or end offset |
-| `ext4_fc_dentry_info` | "the parent inode number, inode number and directory entry" | all widths, whether the name is inline and how its length is carried |
-| `ext4_fc_tail` | "the TID of the commit, CRC of the fast commit of which this tag represents the end of" | CRC algorithm, what range it covers, whether the TID is that of HEAD or of the full commit that follows |
+| tags | HEAD, ADD_RANGE, DEL_RANGE, CREAT, LINK, UNLINK, **PAD**, TAIL | HEAD, ADD_RANGE, DEL_RANGE, CREAT, LINK, UNLINK, **INODE**, TAIL |
 
-Also unspecified: the numeric values of the eight tags, where inside the
-journal the fast commit area begins, and how HEAD's TID is validated
-during recovery.
+The paper has INODE where the documentation has PAD, and the paper's own
+worked examples all rely on INODE. Neither source gives the numeric values
+of the tags, so the ordering that would put INODE at 7 is inference from
+list order, not from either source.
 
-### F.4 What follows from this
+**This means the numbering already implemented here is unverified.** It was
+taken from the documentation's list order with PAD assumed at 7; if INODE
+occupies 7, the current `EXT2_FC_TAG_PAD` is wrong, and an area written
+by a real implementation would be refused by the reader. The reader
+failing closed is the right behaviour for an unknown tag, so the failure
+is safe — but it would be a false refusal, not a correct parse.
 
-The five value structures cannot be implemented from the documentation, and
-deriving them from observed bytes would be fixture-based provenance, which
-§L.4 already flags as a distinct methodology requiring an explicit
-decision.
+### F.4 Still unspecified
 
-So fast commit splits cleanly:
+| Item | Status |
+|---|---|
+| numeric tag values | not in either source |
+| exact field breakdown of ADD_RANGE and DEL_RANGE | semantic description only; sizes given but not the field layout |
+| exact field breakdown of the 16-byte LINK/UNLINK records | size given; the three fields are named ("parent inode, inode number, directory entry") but not their widths or how the name is carried |
+| what the 8 bytes after the TLV in HEAD and TAIL are | HEAD holds a commit ID; TAIL "the checksum of the entire FCLog" — the checksum algorithm and whether the TID is 4 bytes of the 8 is not stated |
+| the 136 bytes of an INODE tag | consistent with a 128-byte inode plus 8, but the 8 is unexplained |
+| whether FC Log sizes are counted in whole blocks | "most FC Logs are 1 block in size, some FC Logs can occupy multiple blocks" — consistent, but the boundary rule is not given |
 
-**Can be built now, from documentation alone**
+### F.5 What this changes
 
-- the TLV framing, with the tag/length encoding identified in F.2 and
-  asserted like every other structure in this filesystem
-- tag dispatch, with an unknown tag refused rather than skipped
-- eligibility, which §3.6.9 states directly: the area is not full, the
-  operation is one the tag set can express, and no commit timer has fired
-- invalidation on full commit, also stated directly
-- the recovery shape §3.6.10 describes: apply records until TAIL, enforce
-  state rather than repeat procedure, and tolerate a partial application
+The framing and eligibility work already committed is **confirmed** rather
+than inferred, and the area's location is answered.
 
-**Cannot be built yet**
-
-- reading or writing any of the five value structures
-- therefore any actual fast commit, on either side
-
-A reader that implements the framing and refuses the values would at
-least be able to walk a fast commit area, validate a TAIL, and decline a
-region it cannot interpret — which is the fail-closed behaviour the rest
-of this filesystem already prefers. That is worth having on its own. It is
-also, on its own, not a fast commit implementation.
+Still not implementable without inventing: the value structures, and the
+numeric tag values. And the tag-set conflict between the two sources has
+to be resolved before any of it can be written, because writing records
+against the wrong numbering produces a log that a correct reader refuses —
+and, worse, a reader that guesses the numbering could misparse a real
+fast commit area rather than rejecting it.
 
 ## I. Extent metadata mining
 
