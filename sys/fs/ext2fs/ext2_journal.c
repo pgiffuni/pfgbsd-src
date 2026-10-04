@@ -47,6 +47,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/_offsetof.h>
 #include <sys/endian.h>
 #include <sys/mutex.h>
 #include <sys/malloc.h>
@@ -219,18 +220,33 @@ ext2_journal_desc_scan(struct ext2_journal *j, const void *buf, size_t len,
 			return (EINVAL);
 		}
 
+		/*
+		 * Read through the asserted structures, not at hand-written
+		 * offsets, so the layout and the code stay one thing.
+		 */
 		if (j->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_CSUM_V3) {
-			flags = be32dec(p + off + 0x04);
-			blocknr = be32dec(p + off + 0x00);
-			blocknr |= (uint64_t)be32dec(p + off + 0x08) << 32;
-			csum = be32dec(p + off + 0x0c);
+			struct ext2fs_journal_tag_csum3 tag;
+
+			memcpy(&tag, p + off, sizeof(tag));
+			flags = be32toh(tag.t_flags);
+			blocknr = be32toh(tag.t_blocknr) |
+			    ((uint64_t)be32toh(tag.t_blocknr_high) << 32);
+			csum = be32toh(tag.t_checksum);
 		} else {
-			flags = be16dec(p + off + 0x06);
-			blocknr = be32dec(p + off + 0x00);
-			csum = be16dec(p + off + 0x04);
-			if (j->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_64BIT)
-				blocknr |=
-				    (uint64_t)be32dec(p + off + 0x08) << 32;
+			struct ext2fs_journal_tag_classic tag;
+			int has_high = (j->j_feature_incompat &
+			    EXT2_JOURNAL_INCOMPAT_64BIT) != 0;
+			size_t fixed = offsetof(struct
+			    ext2fs_journal_tag_classic, t_blocknr_high);
+
+			memcpy(&tag, p + off, fixed + (has_high ?
+			    sizeof(tag.t_blocknr_high) : 0));
+			flags = be16toh(tag.t_flags);
+			blocknr = be32toh(tag.t_blocknr);
+			csum = be16toh(tag.t_checksum);
+			if (has_high)
+				blocknr |= (uint64_t)be32toh(tag.t_blocknr_high)
+				    << 32;
 		}
 
 		/*
@@ -308,7 +324,12 @@ ext2_journal_revoke_scan(struct ext2_journal *j, const void *buf, size_t len,
 	*blocks = NULL;
 	*nblocks = 0;
 
-	count = be32dec(p + 0x0c);		/* bytes */
+	{
+		struct ext2fs_journal_revoke_hdr rh;
+
+		memcpy(&rh, p, sizeof(rh));
+		count = be32toh(rh.rh_count);		/* bytes */
+	}
 	if (count < sizeof(struct ext2fs_journal_revoke_hdr) || count > len)
 		return (EINVAL);
 
@@ -800,22 +821,38 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 			 */
 			flags = (i == ntags) ? EXT2_JOURNAL_TAG_LAST : 0;
 
+			/*
+			 * Written through the asserted structures rather than
+			 * at hand-written offsets, so the code and the layout
+			 * assertions cannot disagree.
+			 */
 			if (csum3) {
-				be32enc(p + 0x00, (uint32_t)jb->jb_bp->b_blkno);
-				be32enc(p + 0x04, flags);
-				be32enc(p + 0x08, 0);
-				be32enc(p + 0x0c, 0);
-				memcpy(p + 0x10, j->j_uuid, 16);
-				p += 32;
+				struct ext2fs_journal_tag_csum3 tag;
+
+				tag.t_blocknr = (uint32_t)jb->jb_bp->b_blkno;
+				tag.t_flags = flags;
+				tag.t_blocknr_high = 0;
+				tag.t_checksum = 0;
+				memcpy(p, &tag, sizeof(tag));
+				memcpy(p + sizeof(tag), j->j_uuid, 16);
+				p += sz;
 			} else {
-				be32enc(p + 0x00, (uint32_t)jb->jb_bp->b_blkno);
-				be16enc(p + 0x04, 0);
-				be16enc(p + 0x06, (uint16_t)flags);
+				struct ext2fs_journal_tag_classic tag;
+
+				tag.t_blocknr = (uint32_t)jb->jb_bp->b_blkno;
+				tag.t_checksum = 0;
+				tag.t_flags = (uint16_t)flags;
+				tag.t_blocknr_high = 0;
+				memcpy(p, &tag, sizeof(tag));
 				if (j->j_feature_incompat &
 				    EXT2_JOURNAL_INCOMPAT_64BIT)
-					be32enc(p + 0x08, 0);
-				memcpy(p + sz - 16, j->j_uuid, 16);
-				p += sz;
+					p += sizeof(tag);
+				else
+					p += offsetof(struct
+					    ext2fs_journal_tag_classic,
+					    t_blocknr_high);
+				memcpy(p, j->j_uuid, 16);
+				p += 16;
 			}
 		}
 	}
@@ -880,7 +917,12 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		count += 0x10;		/* header plus r_count itself */
 		if (ext2_journal_csum_blocks(j))
 			count += 4;
-		be32enc((uint8_t *)bp->b_data + 0x0c, count);
+		{
+			struct ext2fs_journal_revoke_hdr *rh =
+			    (struct ext2fs_journal_revoke_hdr *)bp->b_data;
+
+			rh->rh_count = htobe32(count);
+		}
 
 		error = bwrite(bp);
 		if (error)
