@@ -994,6 +994,13 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 
 	bsize = ump->um_e2fs->e2fs_bsize;
 
+	/*
+	 * Remember where the log stood before this checkpoint.  If anything
+	 * below fails, the boundary does not move: advancing it past blocks
+	 * that were never written home would discard live transactions.
+	 */
+	j->j_reclaim = j->j_cursor;
+
 	STAILQ_FOREACH_SAFE(ck, &j->j_ckpt, ck_link, nck) {
 		error = bread(ump->um_devvp, (daddr_t)ck->ck_jblock,
 		    (int)j->j_blocksize, NOCRED, &jbp);
@@ -1032,14 +1039,37 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 	}
 
 	/*
-	 * Everything committed is now on the filesystem.  Log space is
-	 * deliberately NOT reclaimed: advancing the start block and
-	 * rewriting the journal superblock needs its own ordering
-	 * discipline, and getting that wrong discards a log the filesystem
-	 * may still depend on.  Until it is written and tested the log
-	 * grows without bound.  That is a limitation, not a correctness
-	 * problem, and it is the safer of the two available answers.
+	 * Everything committed is now on the filesystem, so the log up to
+	 * the boundary captured at entry is reclaimable.  Reclaiming means
+	 * recording where the log now begins, and that record has to reach
+	 * the disk before the space is reused -- a crash in between would
+	 * leave the superblock pointing into a region the next boot still
+	 * believes holds live transactions.
+	 *
+	 * The sequence number is advanced first, so a reader can tell a
+	 * superblock that reached the disk torn from a stale one.
 	 */
+	if (j->j_start != j->j_reclaim) {
+		uint32_t old_start = j->j_start;
+		uint32_t old_seq = j->j_sequence;
+
+		j->j_start = j->j_reclaim;
+		j->j_sequence++;
+		error = ext2_journal_write_sb(j);
+		if (error) {
+			/*
+			 * Put the in-memory state back.  If it were left
+			 * advanced and the write had failed, the next
+			 * checkpoint would see start == reclaim and skip
+			 * the rewrite, and the superblock on disk would
+			 * keep pointing at a region we had begun reusing.
+			 */
+			j->j_start = old_start;
+			j->j_sequence = old_seq;
+			return (error);
+		}
+	}
+
 	return (0);
 }
 
@@ -1259,6 +1289,56 @@ ext2_op_abort(struct inode *ip)
 	ump->um_jtrans = NULL;
 	ump->um_jtrans_depth = 0;
 	ext2_journal_trans_abort(t);
+}
+
+/*
+ * Write the journal superblock.
+ *
+ * Block 0 of the journal device, synchronously.  The sequence number has
+ * already been advanced by the caller, so a superblock that reaches the
+ * disk torn is distinguishable from a stale one: the sequence is what a
+ * reader checks, not a checksum over a structure we cannot afford to
+ * trust across a partial write.
+ */
+int
+ext2_journal_write_sb(struct ext2_journal *j)
+{
+	struct ext2mount *ump = j->j_mount;
+	struct ext2fs_journal_bhdr bh;
+	uint8_t *sb;
+	struct buf *bp;
+	int error;
+
+	sb = malloc(EXT2_JOURNAL_SB_SIZE, M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (sb == NULL)
+		return (ENOMEM);
+
+	bh.bh_magic = EXT2_JOURNAL_MAGIC;
+	bh.bh_type = EXT2_JOURNAL_BT_SB_V2;
+	bh.bh_sequence = j->j_sequence;
+	ext2_journal_bhdr_to_disk(sb, &bh);
+	ext2_journal_sb_to_disk(sb, j);
+
+	/*
+	 * The superblock checksum covers the whole structure with its own
+	 * field zeroed, so it is computed over the finished bytes.
+	 */
+	if (ext2_journal_csum_usable(j)) {
+		be32enc(sb + 0xfc, 0);
+		be32enc(sb + 0xfc, calculate_crc32c(calculate_crc32c(~0,
+		    j->j_uuid, 16), sb, EXT2_JOURNAL_SB_SIZE));
+	}
+
+	bp = getblk(ump->um_devvp, 0, (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
+	if (bp == NULL) {
+		free(sb, M_EXT2JOURNAL);
+		return (ENOMEM);
+	}
+	memcpy(bp->b_data, sb, EXT2_JOURNAL_SB_SIZE);
+	vfs_bio_clrbuf(bp);
+	error = bwrite(bp);
+	free(sb, M_EXT2JOURNAL);
+	return (error);
 }
 
 /*
