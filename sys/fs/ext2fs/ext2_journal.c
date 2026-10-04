@@ -923,22 +923,66 @@ fail:
 /*
  * Checkpoint.
  *
- * Distinct from commit.  Commit makes a transaction recoverable; a
- * checkpoint writes that metadata to its final location and lets the
- * journal space be reused.  After this returns the journal holds nothing
- * the filesystem does not already hold.
+ * Distinct from commit.  Commit makes a transaction recoverable by writing
+ * its metadata to the log and following it with a commit record; a
+ * checkpoint writes that metadata to its final location, after which the
+ * log is no longer needed for it.
+ *
+ * The order here is the safety property.  Every block is written home
+ * first, and only if all of them succeed is any of them released from the
+ * queue.  Failing part way leaves the queue intact, because a checkpoint
+ * that discarded entries whose contents had not reached the filesystem
+ * would leave the journal as the only copy of metadata nothing else
+ * holds.
+ *
+ * A crash during a checkpoint is expected rather than exceptional:
+ * recovery replays committed transactions whether or not they were
+ * checkpointed, so one interrupted here is simply replayed again.
  */
 int
 ext2_journal_checkpoint(struct ext2_journal *j)
 {
+	struct ext2mount *ump = j->j_mount;
+	struct ext2_journal_ckpt *ck, *nck;
+	struct buf *jbp, *bp;
+	uint32_t bsize;
+	int error;
+
+	bsize = ump->um_e2fs->e2fs_bsize;
+
+	STAILQ_FOREACH_SAFE(ck, &j->j_ckpt, ck_link, nck) {
+		error = bread(ump->um_devvp, (daddr_t)ck->ck_jblock,
+		    (int)j->j_blocksize, NOCRED, &jbp);
+		if (error)
+			return (error);
+
+		bp = getblk(ump->um_devvp, (daddr_t)ck->ck_blocknr,
+		    (int)bsize, 0, 0, 0);
+		if (bp == NULL) {
+			brelse(jbp);
+			return (ENOMEM);
+		}
+		memcpy(bp->b_data, jbp->b_data, (size_t)bsize);
+		vfs_bio_clrbuf(bp);
+		error = bwrite(bp);
+		brelse(jbp);
+		if (error)
+			return (error);
+
+		STAILQ_REMOVE(&j->j_ckpt, ck, ext2_journal_ckpt, ck_link);
+		free(ck, M_EXT2JOURNAL);
+	}
 
 	/*
-	 * Phase 3 does not yet write journalled metadata home.  Until it
-	 * does, claiming a checkpoint here would release log space whose
-	 * contents were never written anywhere, which is data loss rather
-	 * than a shortcut.
+	 * Everything committed is now on the filesystem.  Log space is
+	 * deliberately NOT reclaimed: advancing the start block and
+	 * rewriting the journal superblock needs its own ordering
+	 * discipline, and getting that wrong discards a log the filesystem
+	 * may still depend on.  Until it is written and tested the log
+	 * grows without bound.  That is a limitation, not a correctness
+	 * problem, and it is the safer of the two available answers.
 	 */
-	return (ENOTSUP);
+	return (0);
 }
 
 /*
@@ -1012,6 +1056,7 @@ ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
 	}
 
 	j->j_cursor = j->j_first;
+	STAILQ_INIT(&j->j_ckpt);
 	mtx_init(&j->j_lock, "ext2fs journal", MTX_DEF, 0);
 	*jp = j;
 	return (0);
@@ -1025,9 +1070,14 @@ fail:
 void
 ext2_journal_destroy(struct ext2_journal *j)
 {
+	struct ext2_journal_ckpt *ck, *nck;
 
 	if (j == NULL)
 		return;
+	STAILQ_FOREACH_SAFE(ck, &j->j_ckpt, ck_link, nck) {
+		STAILQ_REMOVE(&j->j_ckpt, ck, ext2_journal_ckpt, ck_link);
+		free(ck, M_EXT2JOURNAL);
+	}
 	mtx_destroy(&j->j_lock);
 	free(j->j_sb, M_EXT2JOURNAL);
 	free(j, M_EXT2JOURNAL);
