@@ -190,6 +190,11 @@ struct ext2fs_journal_commit {
 	uint32_t	jc_commit_nsec;		/* 0x38 */
 };
 
+struct ext2fs_fc_tl {
+	uint16_t	fc_tag;
+	uint16_t	fc_len;		/* the entire field, header included */
+};
+
 /*
  * Layout assertions.
  *
@@ -271,6 +276,15 @@ EXT2_J_ASSERT_OFF(struct ext2fs_journal_revoke_hdr, rh_count, 0x0c);
 
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_revoke_tail, rt_checksum, 0x00);
 
+/*
+ * Fast commit tag/length header.  The widths are derived rather than
+ * documented; see the comment above and ext2_journal_mining.md F.2.
+ */
+EXT2_J_ASSERT_OFF(struct ext2fs_fc_tl, fc_tag, 0x00);
+EXT2_J_ASSERT_OFF(struct ext2fs_fc_tl, fc_len, 0x02);
+_Static_assert(sizeof(struct ext2fs_fc_tl) == 4,
+    "the fast commit tag header is two 16-bit fields");
+
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_header, 0x00);
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_chksum_type, 0x0c);
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_chksum_size, 0x0d);
@@ -296,6 +310,48 @@ _Static_assert(sizeof(struct ext2fs_journal_revoke_tail) == 4,
  */
 _Static_assert(sizeof(struct ext2fs_journal_commit) >= 0x3c,
     "the commit header must at least cover its documented 0x3c bytes");
+
+/*
+ * Fast commit framing.
+ *
+ * Documented by journal.rst 3.6.9, which specifies that the area is a log
+ * of tag-length-values, that each record begins with a tag and the length
+ * of the entire field, and that the tag set is HEAD, ADD_RANGE,
+ * DEL_RANGE, CREAT, LINK, UNLINK, PAD and TAIL.
+ *
+ * The tag and length widths are NOT documented.  Two 16-bit fields is the
+ * only encoding consistent with eight tags and a length bounded by a
+ * journal block, and it is used here on that basis -- derived, not
+ * documented, and recorded as such in ext2_journal_mining.md F.2.
+ *
+ * What follows the tag is not specified at all.  None of the five value
+ * structures is implemented, and a record carrying one is refused rather
+ * than skipped: a length is known, so skipping is safe, but interpreting
+ * one is not, and this filesystem does not guess at a format it cannot
+ * read.
+ */
+#define	EXT2_FC_TAG_HEAD		1
+#define	EXT2_FC_TAG_ADD_RANGE	2
+#define	EXT2_FC_TAG_DEL_RANGE	3
+#define	EXT2_FC_TAG_CREAT	4
+#define	EXT2_FC_TAG_LINK		5
+#define	EXT2_FC_TAG_UNLINK	6
+#define	EXT2_FC_TAG_PAD		7
+#define	EXT2_FC_TAG_TAIL		8
+#define	EXT2_FC_TAG_MIN		EXT2_FC_TAG_HEAD
+#define	EXT2_FC_TAG_MAX		EXT2_FC_TAG_TAIL
+
+/* What a walk of a fast commit area found. */
+struct ext2_fc_scan {
+	uint32_t	fcs_records;
+	uint32_t	fcs_bytes;	/* consumed, including the last field */
+	int		fcs_tail;	/* a TAIL terminated the area */
+	int		fcs_pad;	/* trailing PAD seen */
+};
+
+int	ext2_fc_scan(const void *, size_t, struct ext2_fc_scan *);
+int	ext2_fc_eligible(uint32_t num_fc_blocks, uint32_t live,
+	    uint32_t need, int expressible);
 
 /*
  * Runtime state.  FreeBSD-native, and deliberately not a transliteration
