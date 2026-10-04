@@ -772,41 +772,88 @@ Fast-commit fixtures are deferred with §F.
 
 ## M. FreeBSD implementation decisions
 
-### M.1 Files
+### M.1 We take the JBD2 format, not the JBD2 layer
+
+JBD2 is Linux's journaling *layer* as well as its on-disk format. We adopt
+only the format.
+
+That distinction is deliberate and it is what keeps the two designs from
+being confused with each other. Adopted from JBD2: the block header, the
+superblock, descriptor blocks and tags, commit blocks, revoke blocks,
+feature flags, checksum types and coverage, and the big-endian encoding
+of all of it.
+
+Not adopted: the JBD2 architecture. There is no `handle_t`, no
+`journal_t`, no `transaction_t`, no `struct journal_s`, and no notion of a
+long-lived journal object with a credit pool and a two-phase handle. Those
+concepts encode a design we are not implementing — a per-journal object
+that outlives the operation, with transactions that join and leave it.
+
+Our unit of work is the **filesystem operation** (§7, §S). A transaction
+begins when an operation begins and ends when it commits or aborts. There
+is no slot for an operation to join, and no state that survives it.
+
+### M.2 Files
 
 ```
 sys/fs/ext2fs/ext2_journal.h
 sys/fs/ext2fs/ext2_journal.c            state machine, transactions
-sys/fs/ext2fs/ext2_journal_format.c     serialisation only
 sys/fs/ext2fs/ext2_journal_recovery.c   recovery
 ```
 
-No `ext2_fast_commit.c` until §O is revisited.
+No separate serialisation file, and no `ext2_fast_commit.c` until §O is
+revisited.
 
-Serialisation is kept separate from state-machine logic so that the
-big-endian conversions can be reviewed in one place and asserted
-independently (§26).
+**Endianness conversion lives in `ext2_inode_cnv.c`**, alongside the
+existing `ext2_ei2i()` / `ext2_i2ei()` and the device and extra-time
+encoders. That file already owns every on-disk-to-memory conversion in
+this filesystem, so the journal's belongs there too rather than in a
+second place that would have to be kept in step with the first.
 
-### M.2 Licensing
+The two conventions must stay visibly distinct inside that file. ext2fs
+metadata is little-endian and the journal is big-endian; the journal
+conversions are named `ext2_journal_*` and use `be32toh()` / `htobe32()`
+explicitly, so a reader can tell at the call site which convention is in
+force. No journal field is ever passed through `le32toh()`.
+
+### M.3 Endianness
+
+Journal fields are big-endian. Filesystem metadata is little-endian. This
+is stated by the source documentation and is not negotiable.
+
+Therefore:
+
+- every journal field is converted explicitly in both directions
+- no native structure is cast onto a journal block
+- no journal conversion reuses a little-endian helper, even where the
+  operation looks identical
+- compile-time assertions cover sizes and offsets of the internal
+  serialisation structures
+
+The prior art in §W is instructive here: it converts every field
+correctly and still gets three offsets wrong, because nothing asserted
+them. The assertions are not optional.
+
+### M.4 Licensing
 
 All new files: 2-Clause BSD. No Linux GPL code is copied or translated.
 Every on-disk structure carries a provenance comment naming the
 documentation it came from, and stating that no Linux structure is reused.
 
-### M.3 Native structures
+### M.5 Native structures
 
 FreeBSD-native types for journal state, transactions, handles, buffer
 tracking, recovery state and revoke tracking. Only the **serialised**
 representation matches JBD2. Linux type names are not exposed.
 
-### M.4 Serialisation rules
+### M.6 Serialisation rules
 
 Explicit host↔big-endian conversion in both directions. No casting of
 native structures onto disk blocks. No reliance on compiler packing.
 Compile-time assertions for sizes and offsets of internal serialisation
 structures.
 
-### M.5 Lock order
+### M.7 Lock order
 
 Observed in the current code:
 
@@ -836,14 +883,14 @@ re-acquire (`ext2_alloc.c:312,325`). So there is currently **no
 allocator-level serialisation spanning an extent-tree metadata
 allocation**. Journal work must not assume one.
 
-### M.6 Shutdown
+### M.8 Shutdown
 
 Journal state must not be freed while a transaction, buffer, I/O
 completion, recovery or dependency can reference it. Follow §42 and the
 existing Soft Updates precedent: leak deliberately rather than risk a
 use-after-free, and report it.
 
-### M.7 Mount integration point
+### M.9 Mount integration point
 
 Journal recovery must run between `ext2_vfsops.c:968-969` (the first
 `ext2_sbupdate`, which clears the clean bit) and `:974-975`
@@ -890,14 +937,19 @@ Unmount needs the mirror point: journal stop and final commit before
 | fast-commit numeric tag values | **incomplete** | unpublished |
 | fast-commit replay algorithm | **incomplete** | unpublished |
 
-Secondary, non-normative, used only for behavioural context and cited as
-such: LWN, *"Fast commits for ext4"*, 15 January 2021
-(`https://lwn.net/Articles/842385/`). It supplied the design rationale for
-omitting derivable updates, the concrete set of supported operations, the
-named fallback trigger (extended attributes), the recovery ordering
-(JBD2 first, then fast commits), and the constraint that `fsync()` remains
-a global barrier. **It supplied no byte layout**, and none was taken from
-it.
+**No Linux source or secondary description of Linux was consulted for
+any item in this table**, and none is cited. Linux's journaling
+implementation is deliberately out of scope: it is a different design, and
+reading it invites importing its concepts rather than deriving ours. Every
+row above traces to the published ext4 documentation or to the FreeBSD
+tree. Where documentation stops, the entry says so and implementation
+stops with it.
+
+One consequence worth recording: the fast-commit **recovery ordering** —
+whether JBD2 replay runs before fast-commit replay — is *not* stated in the
+journal documentation, which specifies only that a full commit invalidates
+preceding fast commits. That ordering is therefore recorded as
+**not established**, not guessed.
 
 ---
 
@@ -990,3 +1042,105 @@ not assumed.
 | 6 | Read-only→read-write recovery hook | §M.7 |
 | 7 | `ext2_alloc_meta()` lock asymmetry | §M.5, affects serialisation assumptions |
 | 8 | which of `ext2_update`/`ext2_blkfree`/`ext2_alloccg`/`ext2_nodealloccg`/`ext2_vfree` the journal must hook | §J.4 |
+
+---
+
+## W. Prior art: `pau-sum/freebsd-ext34`, branch `extfs-journaling`
+
+Mined, not ported. This is FreeBSD code under BSD-2-Clause, so it is
+legitimate prior art — and it is the only JBD2 implementation that exists
+in this codebase. It was found late in mining and changes what Phase 1
+should be, so the assessment is recorded here rather than left in a
+transcript.
+
+**Headline: it is a prototype, and its format handling is wrong in three
+places. Do not treat it as evidence about JBD2 difficulty.** It implements
+approximately the 32-bit / SAME_UUID / no-checksum subset, which is not a
+configuration `mke2fs` produces on any modern image.
+
+### W.1 What is wrong
+
+| Defect | Consequence |
+|---|---|
+| `jsb_checksum_type` declared `uint32_t` instead of one byte | pushes `padding2` to 0x54 and `num_fc_blocks` to 0x58; documented 0x51 and 0x54 |
+| `struct ext2fs_journal_sb` is 92 bytes, not 1024 | the on-disk superblock is truncated; `head` (0x58) and `checksum` (0xFC) are absent entirely |
+| `jch_checksum` modelled as `uint32_t[32]` (128 bytes) rather than an opaque 32-byte blob | commit timestamps land at 0x90/0x98 instead of 0x30/0x38 |
+| descriptor tag size is a hardcoded `return (8)` | wrong for any image with 64BIT or without SAME_UUID; the whole descriptor array mis-parses |
+| **no checksum code at all** — 2067 lines, zero | no tag checksum, commit checksum, revoke checksum or superblock checksum; the tag checksum field is literally `= 0; /* TODO */` |
+| no csum_v3 tag, no `blocknr_high` | 64-bit impossible |
+| revoke entries fixed at 4 bytes, revoke tail defined but never referenced | revoke is 32-bit only and unchecksummed |
+| revoke table does not update `jrr_sequence` when a block is re-added | a block revoked early keeps its early sequence, so a later transaction's replay is wrongly permitted — revoke silently fails |
+| recovery swallows all initial-pass errors as "expected end of log" | a genuine I/O error is indistinguishable from clean end-of-log |
+| checkpoint write path is `#if`'d out; the live path sets `B_INVAL` and `brelses` | **metadata is never written home**, while log space is reclaimed anyway. Data loss. |
+| no abort path exists | failure sets a flag nothing tests, notifies no caller, and a waiter can hang |
+| `b_fsprivate1` used to tag journal buffers | **collides head-on with our Soft Updates association** (§J.1) and would corrupt it |
+| journal superblock read from inode block 12, written at block 0 | internally contradictory, and block 12 is not a documented JBD2 location |
+| no `_Static_assert` anywhere | which is how all three offset errors survived |
+| empty `if (error) { }` at nearly every integration site | errors discarded, against §D.6 |
+
+### W.2 Scope: it journals the wrong filesystem
+
+Every integration point is on a path plain ext2 also uses:
+`ext2_indirtrunc()`, `ext2_ind_truncate()`, the indirect arm of
+`ext2_balloc()`, and all 14 `ext2_vnops.c` VOP wrappers.
+
+**`ext2_extents.c` contains no occurrence of the word "journal".** A
+journaled ext4 filesystem with extents mounts, opens a journal, and
+journals nothing.
+
+Worse, the partial state is reachable: `ext4_ext_blkfree()` calls
+`ext2_update()`, which *is* hooked. So an extent operation running inside
+someone else's transaction journals the inode but not the leaf or index
+block — **a partially journaled transaction, which is worse than no
+journaling at all.** That is the failure mode §S exists to prevent.
+
+So the trimming the owner described is not a subtractive edit. Trimming to
+"extents only" removes essentially all of the integration and leaves none,
+because the extent arms were never written.
+
+The branch also reimplements the orphan list in the journal file
+(`ext2_journal_in_orphan_list` / `add_orphan` / `del_orphan`), duplicating
+`ext2_orphan.c` and doing it worse — it writes `i_dtime` from an
+uninitialised `struct timespec`.
+
+### W.3 What is worth keeping
+
+Four ideas, roughly 200 lines' worth, none of them code:
+
+1. **The naming and the API shape.** `struct ext2fs_journal`,
+   `ext2fs_journal_transaction`, `ext2fs_journal_buf`, `EXT2_JLOCK`,
+   `EXT2_JPRESENT` / `EXT2_JACTIVE`, and the
+   `start` / `stop` / `commit_trans` / `checkpoint_trans` / `force_commit`
+   / `revoke_block` split are sensible FreeBSD-native shapes. Notably,
+   **no Linux vocabulary leaked in** — no `handle_t`, `journal_t`,
+   `transaction_t` or `struct journal_s` anywhere in the directory. For
+   prior art that is rare and it is the single most valuable thing here.
+2. **The three-pass recovery skeleton** — find the log end, build a
+   *global* revoke table, then replay non-revoked blocks. It correctly does
+   not start transactions during replay and writes through `getblk` /
+   `bwrite` on the device vnode rather than through `VOP_WRITE`. That is
+   the right architecture and matches §E.2 and §E.5. Keep the shape,
+   discard the body.
+3. **Hooking `ext2_update()` as a single choke point** — one place every
+   inode write already passes through, gated on whether a transaction is
+   active. That is the right *shape* for our `ext4_ext_dirty()` hook too.
+   Take the idea, not the code: the `b_fsprivate1` collision is fatal.
+4. **Unconditional explicit endianness discipline.** Every field access
+   goes through `htobeNN` / `beNNtoh`, with no raw native-order access
+   found anywhere. It still got three offsets wrong because nothing
+   asserted them — which is precisely the argument for §M.3.
+
+### W.4 Bearing on this document
+
+- §W.1's offset errors are the reason §M.3 makes compile-time assertions
+  mandatory rather than advisory.
+- §W.1's hardcoded tag size is the concrete form of §B's warning that
+  CSUM_V2/VS3 and 64-bit are not optional details.
+- §W.2 is the strongest argument for §K's classification being explicit
+  and tested rather than inferred: a partially journaled operation is
+  worse than either consistent choice.
+- §W.3.1 confirms §M.1. Adopting the format did not require adopting the
+  layer, and this codebase had already reached that position
+  independently.
+
+---
