@@ -39,6 +39,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_dinode.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_journal.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
 /*
@@ -342,4 +343,75 @@ ext2_i2ei(struct inode *ip, struct ext2fs_dinode *ei)
 	ext2_ei_csum_set(ip, ei);
 
 	return (0);
+}
+
+/*
+ * Journal conversions.
+ *
+ * The journal is big-endian and the metadata around it is little-endian,
+ * so these deliberately do not reuse any le* helper.  Every field is
+ * read and written individually through be32dec()/be32enc(), which take
+ * a void pointer: a journal block is never cast onto a structure, and no
+ * compiler packing assumption is involved.
+ *
+ * The ext2fs_journal_* structures are used only for the layout
+ * assertions in ext2_journal.h; these functions are the only way to
+ * reach a field.
+ */
+
+void
+ext2_journal_bhdr_from_disk(const void *buf, struct ext2fs_journal_bhdr *bh)
+{
+
+	bh->bh_magic = be32dec((const uint8_t *)buf + 0x00);
+	bh->bh_type = be32dec((const uint8_t *)buf + 0x04);
+	bh->bh_sequence = be32dec((const uint8_t *)buf + 0x08);
+}
+
+void
+ext2_journal_bhdr_to_disk(void *buf, const struct ext2fs_journal_bhdr *bh)
+{
+
+	be32enc((uint8_t *)buf + 0x00, bh->bh_magic);
+	be32enc((uint8_t *)buf + 0x04, bh->bh_type);
+	be32enc((uint8_t *)buf + 0x08, bh->bh_sequence);
+}
+
+/*
+ * Journal superblock, journal.rst 3.6.4.  The raw block is retained by
+ * the caller; this fills in the fields the rest of the code reads and
+ * copies out the identity fields.
+ */
+void
+ext2_journal_sb_from_disk(const void *buf, struct ext2_journal *j)
+{
+	const uint8_t *p = buf;
+	struct ext2fs_journal_bhdr bh;
+
+	ext2_journal_bhdr_from_disk(p, &bh);
+	j->j_feature_compat = be32dec(p + 0x24);
+	j->j_feature_incompat = be32dec(p + 0x28);
+	j->j_feature_ro_compat = be32dec(p + 0x2c);
+	memcpy(j->j_uuid, p + 0x30, sizeof(j->j_uuid));
+	j->j_nr_users = be32dec(p + 0x40);
+	j->j_checksum_type = p[0x50];
+	j->j_blocksize = be32dec(p + 0x0c);
+	j->j_maxlen = be32dec(p + 0x10);
+	j->j_first = be32dec(p + 0x14);
+}
+
+void
+ext2_journal_sb_to_disk(void *buf, const struct ext2_journal *j)
+{
+	uint8_t *p = buf;
+
+	be32enc(p + 0x24, j->j_feature_compat);
+	be32enc(p + 0x28, j->j_feature_incompat);
+	be32enc(p + 0x2c, j->j_feature_ro_compat);
+	memcpy(p + 0x30, j->j_uuid, sizeof(j->j_uuid));
+	be32enc(p + 0x40, j->j_nr_users);
+	p[0x50] = j->j_checksum_type;
+	be32enc(p + 0x0c, j->j_blocksize);
+	be32enc(p + 0x10, j->j_maxlen);
+	be32enc(p + 0x14, j->j_first);
 }

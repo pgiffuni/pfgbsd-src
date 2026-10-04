@@ -3845,6 +3845,7 @@ fs/ext2fs/ext2_extattr.c	optional ext2fs
 fs/ext2fs/ext2_extents.c	optional ext2fs
 fs/ext2fs/ext2_inode.c		optional ext2fs
 fs/ext2fs/ext2_inode_cnv.c	optional ext2fs
+fs/ext2fs/ext2_journal.c	optional ext2fs
 fs/ext2fs/ext2_hash.c		optional ext2fs
 fs/ext2fs/ext2_htree.c		optional ext2fs
 fs/ext2fs/ext2_lookup.c		optional ext2fs
