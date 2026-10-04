@@ -147,3 +147,77 @@ dumpe2fs -h /tmp/fix.img | grep -i journal
 Those two outputs give the journal's physical extent and its features,
 sequence and start block — which is enough to locate the log and to tell
 whether the descriptor tag width is 8 bytes or 32.
+
+## Second fixture set: a transaction that really happened
+
+Produced by mounting an ext4 image read-write on Linux, writing files,
+renaming, unlinking, truncating and creating a large file, then a **lazy**
+unmount so the log was left holding what it had written:
+
+```
+truncate -s 64M fix.img
+mke2fs -q -t ext4 -b 1024 -I 128 fix.img
+debugfs -w -R "sif <2> uid 1000" fix.img
+mkdir mnt && sudo mount -o loop,rw fix.img mnt
+  for i in $(seq 1 40); do echo x > f$i; done
+  dd if=/dev/urandom of=big bs=1k count=400
+  mkdir -p a/b/c && mv f1 a/renamed && rm -f f2
+  truncate -s 4k big && sync
+sudo umount -l mnt            # dirty on purpose
+```
+
+The kernel, not `mke2fs`, then set the journal features:
+
+```
+Journal features:  journal_64bit journal_checksum_v3     -> incompat = 0x12
+Journal sequence:  0x00000002
+Journal start:     1
+```
+
+which is the combination that selects a 32-byte descriptor tag instead of
+8. `mke2fs` never produces it, and it is the highest-risk path in the
+reader.
+
+Fixtures, all 1024 bytes:
+
+| file | block | contents |
+|---|---|---|
+| `journal-sb-1k.bin` | 0 | superblock, no features |
+| `journal-desc-64bit-csumv3.bin` | 1 | descriptor, 21 tags |
+| `journal-commit-64bit-csumv3.bin` | 23 | commit record for that sequence |
+
+sha256 prefixes: `9a8ec2bf084a45e0`, `26b2b26424149647`, `d5dde4b625d6d8d6`.
+
+### What the transaction fixtures established
+
+The descriptor parses with the offsets `ext2_journal.h` asserts. It
+holds 21 tags, the last carrying `LAST_TAG`, with flags `{0, 2, 10}` --
+so it exercises both the 32-byte form (uuid present) and the 16-byte form
+(`SAME_UUID` set). The 21 data blocks follow at journal blocks 2..22 and
+the commit record sits at block 23, which is exactly the layout
+`ext2_journal_scan_pass()` assumes.
+
+The commit record's timestamp is at 0x30, as documented, and decodes to
+17:34:50 UTC -- the moment of the lazy unmount.
+
+The commit checksum covers **the journal UUID followed by the entire
+1024-byte commit block**, with the first checksum word taken as zero:
+
+```
+commit_csum = crc32c(0, journal_uuid || commit_block[0..1024])
+```
+
+i.e. the standard CRC32C of the concatenation. This was established by
+finding the stored value `0xb60191c2` among the candidate coverages rather
+than by reasoning about which the documentation implies.
+
+### A convention this cannot settle here
+
+The published values are in terms of Linux's `crc32c()`, which xors on
+entry and **not** on exit. FreeBSD's `calculate_crc32c()` has different
+chaining semantics, and `sys/crc32c.c` is not present in this tree, so
+the FreeBSD spelling of each rule could not be confirmed against its
+source -- only against the bytes. The superblock rule was written to match
+what the real bytes require; the commit rule is recorded above and still
+needs its `calculate_crc32c()` expression checked against a system where
+that source is available.
