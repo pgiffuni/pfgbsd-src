@@ -610,14 +610,59 @@ ext2_journal_commit_csum_verify(struct ext2_journal *j, const void *buf,
 
 static uint32_t ext2_journal_next_sequence;
 
-/* Take the next log block, wrapping at the end of the journal. */
+/*
+ * Advance the log cursor by n blocks, within [j_first, j_maxlen).
+ *
+ * The wrap is to j_first, not to zero.  Block 0 is the journal
+ * superblock; writing a transaction over it destroys the only record of
+ * where the log begins, and a filesystem whose journal superblock has been
+ * overwritten by a data block cannot be recovered by replaying it.
+ */
+int
+ext2_journal_advance(struct ext2_journal *j, uint32_t n)
+{
+	uint64_t next;
+
+	if (j->j_maxlen <= j->j_first)
+		return (ENOMEM);
+
+	next = (uint64_t)j->j_cursor + n;
+	if (next > j->j_maxlen)
+		return (ENOMEM);		/* would pass the end of the log */
+	j->j_cursor = (uint32_t)next;
+	return (0);
+}
+
 static uint32_t
 ext2_journal_cursor(struct ext2_journal *j)
 {
 	uint32_t b = j->j_cursor;
 
-	j->j_cursor = (j->j_maxlen != 0) ? ((b + 1) % j->j_maxlen) : b + 1;
+	if (j->j_maxlen <= j->j_first)
+		return (b);
+	if (++b >= j->j_maxlen)
+		b = j->j_first;
+	j->j_cursor = b;
 	return (b);
+}
+
+/*
+ * Blocks in the log that are still live: committed but not yet
+ * checkpointed to their home locations.  The run runs from j_start to the
+ * cursor and may wrap.
+ */
+uint32_t
+ext2_journal_live(struct ext2_journal *j)
+{
+
+	if (j->j_maxlen <= j->j_first)
+		return (0);
+	if (j->j_start == j->j_cursor)
+		return (0);
+	if (j->j_start < j->j_cursor)
+		return (j->j_cursor - j->j_start);
+	/* wrapped */
+	return (j->j_maxlen - j->j_start) + (j->j_cursor - j->j_first);
 }
 
 static void
@@ -629,6 +674,95 @@ ext2_journal_write_bhdr(struct buf *bp, uint32_t type, uint32_t sequence)
 	bh.bh_type = type;
 	bh.bh_sequence = sequence;
 	ext2_journal_bhdr_to_disk(bp->b_data, &bh);
+}
+
+/*
+ * How many journal blocks a transaction needs before it starts.
+ *
+ * Everything the log will receive has to be counted, because a
+ * transaction that runs out half way leaves a descriptor naming data that
+ * was never written:
+ *
+ *	descriptor blocks	for the tags
+ *	metadata blocks	one per journalled buffer
+ *	revoke blocks		one per 64-bit entry that fits
+ *	commit record		always one
+ *
+ * Computed before the transaction is admitted and compared against the
+ * space actually free, so the whole operation is refused rather than
+ * partly written.
+ */
+static uint32_t
+ext2_journal_revokes_per_block(const struct ext2_journal *j)
+{
+	uint32_t width, space;
+
+	/* header (12) + r_count (4), then the tail when there is one */
+	space = j->j_blocksize;
+	if (space <= 16)
+		return (0);
+	width = (j->j_feature_incompat & EXT2_JOURNAL_INCOMPAT_64BIT) ? 8 : 4;
+	if (ext2_journal_csum_blocks(j))
+		space -= 4;
+	return ((space - 16) / width);
+}
+
+static uint32_t
+ext2_journal_tags_per_block(const struct ext2_journal *j)
+{
+	uint32_t space, sz;
+
+	space = j->j_blocksize;
+	if (space <= 12)
+		return (0);
+	if (ext2_journal_csum_blocks(j))
+		space -= 4;
+	/* the widest encoding a journal we accept can produce */
+	sz = ext2_journal_tag_size(j, 0, NULL);
+	if (sz == 0 || sz > space - 12)
+		return (0);
+	return ((space - 12) / sz);
+}
+
+uint32_t
+ext2_journal_footprint(struct ext2_journal_trans *t)
+{
+	struct ext2_journal *j = t->jt_journal;
+	uint32_t tags = 0, per_desc, per_revoke, desc, revoke;
+	struct ext2_journal_buf *jb;
+
+	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
+		tags++;
+	per_desc = ext2_journal_tags_per_block(j);
+	per_revoke = ext2_journal_revokes_per_block(j);
+
+	desc = (per_desc && tags) ? (tags + per_desc - 1) / per_desc : 0;
+	desc = desc ? desc : (tags ? 1 : 0);
+	revoke = (per_revoke && t->jt_nrevoked) ?
+	    (t->jt_nrevoked + per_revoke - 1) / per_revoke : 0;
+
+	return (desc + tags + revoke + 1);	/* + the commit record */
+}
+
+/*
+ * Is there room for a transaction of this many blocks?
+ *
+ * Checked again at commit, against the metadata actually queued, because
+ * the caller reserves before it knows how many buffers the operation will
+ * dirty.
+ */
+static int
+ext2_journal_has_room(struct ext2_journal *j, uint32_t blocks)
+{
+
+	if (EXT2_JOURNAL_CACITY(j) == 0)
+		return (0);
+	if (ext2_journal_live(j) + blocks > EXT2_JOURNAL_CACITY(j))
+		return (0);
+	/* the cursor must be able to advance that far without passing the end */
+	if ((uint64_t)j->j_cursor - j->j_first + blocks > EXT2_JOURNAL_CACITY(j))
+		return (0);
+	return (1);
 }
 
 /*
@@ -647,6 +781,14 @@ ext2_journal_trans_start(struct ext2_journal *j, uint32_t nblocks,
 
 	if (j->j_readonly)
 		return (EROFS);
+
+	/*
+	 * A floor, not the answer: the real footprint also depends on the
+	 * tags those buffers produce and on any revocations.
+	 */
+	if (EXT2_JOURNAL_CACITY(j) == 0 ||
+	    nblocks + 2 > EXT2_JOURNAL_CACITY(j))
+		return (ENOMEM);
 
 	t = malloc(sizeof(*t), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
 	if (t == NULL)
@@ -682,6 +824,16 @@ ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
 		if (jb->jb_bp->b_blkno == bp->b_blkno)
 			return (0);		/* already in this transaction */
+	}
+
+	/*
+	 * A tag array that overruns its descriptor block runs into the
+	 * next block's header, and the whole array is lost rather than one
+	 * tag being wrong.
+	 */
+	if (ext2_journal_tags_per_block(t->jt_journal) == 0) {
+		t->jt_error = EINVAL;
+		return (EINVAL);
 	}
 
 	jb = malloc(sizeof(*jb), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
@@ -777,7 +929,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	struct ext2_journal *j;
 	struct ext2mount *ump;
 	struct buf *bp;
-	uint32_t ntags, jblock;
+	uint32_t ntags, jblock, footprint;
 	int error;
 
 	if (t == NULL)
@@ -794,13 +946,27 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 
 	j = t->jt_journal;
 	ump = j->j_mount;
-	jblock = j->j_first;
 	ntags = 0;
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
 		ntags++;
 	if (ntags == 0) {
 		ext2_journal_trans_abort(t);
 		return (0);
+	}
+
+	/*
+	 * The authoritative admission check.  The reservation taken at
+	 * start was a floor, known before the operation had dirtied
+	 * anything; this is the real footprint.  If it does not fit, the
+	 * transaction is refused with nothing written, because a
+	 * descriptor naming data which never lands is worse than a failed
+	 * operation.
+	 */
+	footprint = ext2_journal_footprint(t);
+	if (!ext2_journal_has_room(j, footprint)) {
+		t->jt_error = ENOMEM;
+		ext2_journal_trans_abort(t);
+		return (ENOMEM);
 	}
 
 	/* One descriptor block covers this transaction's tags. */
