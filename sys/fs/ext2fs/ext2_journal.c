@@ -431,15 +431,25 @@ ext2_journal_csum(const struct ext2_journal *j, const void *buf, size_t len,
 }
 
 /*
- * Superblock checksum: the whole 1024-byte structure with the checksum
- * field itself taken as zero.
+ * Superblock checksum.
+ *
+ * The whole 1024-byte structure with the checksum field taken as zero,
+ * and -- unlike every other checksum in the journal -- with no journal
+ * UUID mixed in.  The UUID belongs to the checksums over descriptor,
+ * data, revoke and commit blocks; the superblock already carries it at
+ * 0x30, so seeding with it would cover those bytes twice.
+ *
+ * The convention is verified against a superblock written by a real
+ * implementation: the stored value is crc32c(0, sb, 1024) under Linux's
+ * crc32c(), which xors on entry and not on exit.  calculate_crc32c()
+ * xors on both, so the equivalent here is its result inverted.  Getting
+ * either detail wrong rejects every journal.
  */
 int
 ext2_journal_sb_csum_verify(struct ext2_journal *j, const void *buf, size_t len)
 {
 	uint8_t sb[EXT2_JOURNAL_SB_SIZE];
 	uint32_t want, got;
-	int error;
 
 	if (len < EXT2_JOURNAL_SB_SIZE)
 		return (EINVAL);
@@ -450,9 +460,10 @@ ext2_journal_sb_csum_verify(struct ext2_journal *j, const void *buf, size_t len)
 	want = be32dec(sb + 0xfc);
 	be32enc(sb + 0xfc, 0);		/* covered with the field zeroed */
 
-	error = ext2_journal_csum(j, sb, EXT2_JOURNAL_SB_SIZE, &got);
-	if (error)
-		return (error);
+	/*
+	 * Deliberately not ext2_journal_csum(), which seeds with the UUID.
+	 */
+	got = calculate_crc32c(0, sb, EXT2_JOURNAL_SB_SIZE) ^ 0xFFFFFFFF;
 	return (got == want ? 0 : EBADMSG);
 }
 
@@ -1355,9 +1366,14 @@ ext2_journal_write_sb(struct ext2_journal *j)
 	 * field zeroed, so it is computed over the finished bytes.
 	 */
 	if (ext2_journal_csum_usable(j)) {
+		/*
+		 * Same rule the reader applies: no UUID, and the
+		 * calculate_crc32c() result inverted, because Linux's
+		 * crc32c() xors on entry only.
+		 */
 		be32enc(sb + 0xfc, 0);
-		be32enc(sb + 0xfc, calculate_crc32c(calculate_crc32c(~0,
-		    j->j_uuid, 16), sb, EXT2_JOURNAL_SB_SIZE));
+		be32enc(sb + 0xfc,
+		    calculate_crc32c(0, sb, EXT2_JOURNAL_SB_SIZE) ^ 0xFFFFFFFF);
 	}
 
 	bp = getblk(ump->um_devvp, 0, (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
