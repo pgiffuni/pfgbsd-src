@@ -221,3 +221,40 @@ source -- only against the bytes. The superblock rule was written to match
 what the real bytes require; the commit rule is recorded above and still
 needs its `calculate_crc32c()` expression checked against a system where
 that source is available.
+
+## journal-dirty.img and journal-scan-check.py
+
+`journal-dirty.img` carries a journal that has **not** been
+checkpointed, so the scan has real work to do rather than an empty log to
+walk.  It is not a disk image: it holds the 64 journal blocks the scan
+walks plus the filesystem blocks those tags target, behind a small `JHD0`
+header, which is 87 KB rather than the 64 MB the whole image would be.
+
+`journal-scan-check.py` is a faithful port of `ext2_journal_scan_pass()`
+and the replay ordering, run against it.  Against this journal:
+
+```
+journal: first=1 maxlen=4096 incompat=0x12
+scan terminated after 3 steps, log end at block 24
+reached block 0: no
+  seq 2: 21 tags, committed=True, replayable=True
+of 21 journalled blocks, 1 still differ from the filesystem
+```
+
+Three things that is worth having:
+
+- the scan terminates, and in three steps rather than one per block
+- it never touches block 0, which is the wrap defect this work fixed
+- it finds the committed transaction and steps over its 21 data blocks by
+  tag count, rather than trying to read them as journal blocks
+
+The last line is the one that says something about the world rather than
+about the code: only **one** of the 21 journalled blocks still differs
+from the filesystem. The kernel had already replayed and checkpointed
+most of that transaction before the unmount. So the realistic recovery
+case is "almost everything already applied", and a reader that assumes a
+journalled block is always unapplied would be doing far more work than
+the journal requires.
+
+This tests the algorithm, not the C. The C is a separate transcription of
+the same steps and has still never executed.
