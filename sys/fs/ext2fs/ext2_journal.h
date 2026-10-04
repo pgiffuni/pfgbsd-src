@@ -54,8 +54,15 @@
 
 #include <sys/types.h>
 #include <sys/queue.h>
+#include <sys/buf.h>
+#include <sys/mutex.h>
+#include <sys/mount.h>
+#include <sys/vnode.h>
 
 #include <sys/_offsetof.h>
+
+#include <fs/ext2fs/ext2fs.h>
+#include <fs/ext2fs/ext2_mount.h>
 
 /* Journal block magic, documented at journal.rst 3.6.3. */
 #define	EXT2_JOURNAL_MAGIC		0xc03b3998
