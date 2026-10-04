@@ -65,7 +65,7 @@ ext2_dep_bwrite_depth(struct buf *bp, unsigned int depth)
 	struct buf *prebp;
 	int error;
 
-	KASSERT(bp != NULL, "ext2_dep_bwrite: NULL buffer");
+	KASSERT(bp != NULL, ("ext2_dep_bwrite: NULL buffer"));
 	if (depth >= EXT2_DEP_MAXDEPTH)
 		return (EIO);
 
@@ -218,7 +218,7 @@ ext2_dep_defer(struct buf *bp, int class)
 {
 	struct ext2_dep *dep;
 
-	KASSERT(bp != NULL, "ext2_dep_defer: NULL buffer");
+	KASSERT(bp != NULL, ("ext2_dep_defer: NULL buffer"));
 
 	dep = EXT2_BP_DEP(bp);
 	if (dep == NULL) {
@@ -253,7 +253,7 @@ ext2_dep_write(struct buf *bp, int class)
 {
 	struct ext2_dep *dep;
 
-	KASSERT(bp != NULL, "ext2_dep_write: NULL buffer");
+	KASSERT(bp != NULL, ("ext2_dep_write: NULL buffer"));
 
 	dep = EXT2_BP_DEP(bp);
 	if (dep == NULL)
@@ -279,7 +279,7 @@ ext2_dep_write(struct buf *bp, int class)
 void
 ext2_dep_bdwrite(struct buf *bp)
 {
-	KASSERT(bp != NULL, "ext2_dep_bdwrite: NULL buffer");
+	KASSERT(bp != NULL, ("ext2_dep_bdwrite: NULL buffer"));
 
 	if (EXT2_BP_DEP(bp) == NULL) {
 		bdwrite(bp);
@@ -304,7 +304,7 @@ int
 ext2_dep_bawrite(struct buf *bp)
 {
 
-	KASSERT(bp != NULL, "ext2_dep_bawrite: NULL buffer");
+	KASSERT(bp != NULL, ("ext2_dep_bawrite: NULL buffer"));
 	if (EXT2_BP_DEP(bp) == NULL) {
 		bawrite(bp);
 		return (0);
