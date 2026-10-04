@@ -1804,3 +1804,92 @@ ext2_unmount_journal(struct ext2mount *ump)
 	ump->um_journal = NULL;
 	ump->um_jtrans = NULL;
 }
+
+/*
+ * Fast commit: the framing only.
+ *
+ * Documented, and implemented: the tag-length-value structure of
+ * journal.rst 3.6.9, the tag set, and the conditions under which a fast
+ * commit is permitted.
+ *
+ * Not documented, and therefore not implemented: the five value
+ * structures.  A record carrying one is reported rather than parsed, so
+ * this cannot yet produce or consume a fast commit.  What it can do is
+ * walk an area, validate its framing, and say plainly that it does not
+ * understand the rest -- which is the same fail-closed posture the rest
+ * of this reader takes.
+ */
+int
+ext2_fc_scan(const void *buf, size_t len, struct ext2_fc_scan *sc)
+{
+	const uint8_t *p = buf;
+	size_t off = 0;
+	struct ext2fs_fc_tl tl;
+	uint32_t tag;
+
+	memset(sc, 0, sizeof(*sc));
+
+	while (off + sizeof(tl) <= len) {
+		memcpy(&tl, p + off, sizeof(tl));
+		tag = be16dec(p + off + offsetof(struct ext2fs_fc_tl, fc_tag));
+		off += sizeof(tl);
+
+		if (tl.fc_len < sizeof(tl)) {
+			/*
+			 * A length that does not even cover its own header
+			 * cannot be advanced past, so the area cannot be
+			 * walked.  Refuse it rather than guess.
+			 */
+			return (EBADMSG);
+		}
+		if (tl.fc_len - sizeof(tl) > len - off) {
+			/* The record claims more than the area holds. */
+			return (EBADMSG);
+		}
+		if (tag < EXT2_FC_TAG_MIN || tag > EXT2_FC_TAG_MAX)
+			return (EBADMSG);		/* unknown: do not skip it */
+
+		sc->fcs_records++;
+		if (tag == EXT2_FC_TAG_TAIL)
+			sc->fcs_tail = 1;
+		if (tag == EXT2_FC_TAG_PAD)
+			sc->fcs_pad = 1;
+
+		off += tl.fc_len - sizeof(tl);
+		if (sc->fcs_tail)
+			break;
+	}
+
+	sc->fcs_bytes = (uint32_t)off;
+	return (0);
+}
+
+/*
+ * Is a fast commit permitted?
+ *
+ * journal.rst 3.6.9 gives three conditions, and they are all of the
+ * format: the area is not full, the operation is one the tag set can
+ * express, and no commit timer has fired.  The first is arithmetic; the
+ * second is the caller's judgement about whether the operation maps onto a
+ * tag; the third is the caller's too, since this reader has no commit
+ * timer of its own.
+ *
+ * Deliberately not asking "does this look simple".  The documented test
+ * is whether the operation is representable, and conflating the two is
+ * how a fast commit ends up carrying something it cannot express.
+ */
+int
+ext2_fc_eligible(uint32_t num_fc_blocks, uint32_t live, uint32_t need,
+    int expressible)
+{
+
+	if (!expressible)
+		return (0);
+	if (num_fc_blocks == 0)
+		return (0);		/* the area is not there */
+	if (live > num_fc_blocks)
+		return (0);		/* already inconsistent */
+	if (need > num_fc_blocks - live)
+		return (0);		/* would not fit */
+	return (1);
+}
