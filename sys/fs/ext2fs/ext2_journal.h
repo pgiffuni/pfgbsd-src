@@ -275,6 +275,8 @@ struct ext2_journal {
 	uint8_t			 j_checksum_type;
 	struct mtx		 j_lock;
 	int			 j_readonly;
+	uint32_t		 j_cursor;	/* next log block to write */
+	int			 j_writable;
 };
 
 /* Deserialised, host-endian view of one descriptor tag. */
@@ -329,15 +331,16 @@ struct ext2_journal_filedesc {
 /*
  * One transaction found by the scanner: the tags of every descriptor
  * block belonging to it.  A transaction is recoverable only when a commit
- * block with a matching sequence was seen.
+ * block with a matching sequence was seen.  Distinct from
+ * ext2_journal_trans below, which is one in progress being written.
  */
-struct ext2_journal_trans {
+struct ext2_journal_scan_trans {
 	uint32_t		tr_sequence;
 	STAILQ_HEAD(, ext2_journal_filedesc) tr_filedescs;
 	int			tr_has_commit;
 	int			tr_committed;
 	int			tr_replayed;	/* recovery bookkeeping */
-	STAILQ_ENTRY(ext2_journal_trans) tr_link;
+	STAILQ_ENTRY(ext2_journal_scan_trans) tr_link;
 };
 
 struct ext2_journal_scan {
@@ -345,7 +348,7 @@ struct ext2_journal_scan {
 	uint32_t		 sc_start;	/* first block of the log */
 	uint32_t		 sc_end;	/* one past the last used block */
 	uint32_t		 sc_next_sequence;
-	STAILQ_HEAD(, ext2_journal_trans) sc_trans;
+	STAILQ_HEAD(, ext2_journal_scan_trans) sc_trans;
 	STAILQ_HEAD(, ext2_journal_revoked) sc_revoked;
 	int			 sc_error;	/* sticky; fail closed */
 };
@@ -375,6 +378,41 @@ int	ext2_journal_tag_csum_verify(struct ext2_journal *,
 	    const struct ext2_journal_tag *, const void *, size_t, int);
 int	ext2_journal_commit_csum_verify(struct ext2_journal *, const void *,
 	    size_t);
+
+/*
+ * A transaction in progress.  Created when a filesystem operation begins
+ * and destroyed when it commits or aborts, so unlike a JBD2 handle it has
+ * no lifetime beyond the operation and no slot for an operation to join.
+ */
+struct ext2_journal_trans {
+	struct ext2_journal	*jt_journal;
+	uint32_t		 jt_sequence;
+	uint32_t		 jt_reserved;	/* journal blocks reserved */
+	uint32_t		 jt_used;	/* journal blocks consumed */
+	int			 jt_error;	/* sticky */
+	int			 jt_dirty;	/* metadata seen */
+	STAILQ_HEAD(, ext2_journal_buf) jt_bufs;
+};
+
+struct ext2_journal_buf {
+	struct buf		*jb_bp;
+	STAILQ_ENTRY(ext2_journal_buf) jb_link;
+};
+
+/* Writer entry points.  All synchronous in this phase. */
+int	ext2_journal_create(struct ext2mount *, struct m_ext2fs *);
+int	ext2_journal_open_journal(struct ext2mount *, struct m_ext2fs *,
+	    struct ext2_journal **);
+void	ext2_journal_destroy(struct ext2_journal *);
+
+int	ext2_journal_trans_start(struct ext2_journal *, uint32_t nblocks,
+	    struct ext2_journal_trans **);
+int	ext2_journal_dirty_metadata(struct ext2_journal_trans *,
+	    struct buf *);
+int	ext2_journal_revoke_block(struct ext2_journal_trans *, uint64_t);
+int	ext2_journal_trans_commit(struct ext2_journal_trans *);
+void	ext2_journal_trans_abort(struct ext2_journal_trans *);
+int	ext2_journal_checkpoint(struct ext2_journal *);
 
 /* Implemented in ext2_journal_recovery.c. */
 int	ext2_journal_scan(struct ext2_journal *, struct ext2_journal_scan *);
