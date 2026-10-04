@@ -392,6 +392,7 @@ struct ext2_journal_trans {
 	int			 jt_error;	/* sticky */
 	int			 jt_dirty;	/* metadata seen */
 	int			 jt_revoked;	/* revocations queued */
+	uint32_t		 jt_nrevoked;	/* count, for the ceiling */
 	STAILQ_HEAD(, ext2_journal_buf) jt_bufs;
 	STAILQ_HEAD(, ext2_journal_revoke) jt_revokes;
 };
@@ -424,6 +425,18 @@ int	ext2_journal_revoke_block(struct ext2_journal_trans *, uint64_t);
 int	ext2_journal_trans_commit(struct ext2_journal_trans *);
 void	ext2_journal_trans_abort(struct ext2_journal_trans *);
 int	ext2_journal_checkpoint(struct ext2_journal *);
+
+/*
+ * Ceiling on revocations held by one transaction.
+ *
+ * Truncating a large file frees millions of blocks, and each needs a
+ * revocation so that replay does not write it back over its new owner.
+ * There is no bound on that set short of memory, so it is bounded here
+ * and the transaction fails when it is reached.  Failing is the right
+ * answer: carrying on would silently stop revoking, which is precisely
+ * the failure revocation exists to prevent.
+ */
+#define	EXT2_JOURNAL_MAX_REVOKES	65536
 
 /* Operation scope: the unit of journalling. */
 int	ext2_mount_journal(struct ext2mount *, int ronly);
