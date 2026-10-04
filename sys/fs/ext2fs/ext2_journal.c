@@ -178,6 +178,7 @@ ext2_journal_desc_scan(struct ext2_journal *j, const void *buf, size_t len,
 	struct ext2_journal_tag *tags;
 	const uint8_t *p = buf;
 	size_t off, limit;
+	struct ext2fs_journal_bhdr bh;
 	int n, cap, sz, last;
 	uint32_t flags;
 	uint64_t blocknr;
@@ -198,6 +199,7 @@ ext2_journal_desc_scan(struct ext2_journal *j, const void *buf, size_t len,
 	if (limit <= sizeof(struct ext2fs_journal_bhdr))
 		return (EINVAL);
 
+	ext2_journal_bhdr_from_disk(buf, &bh);
 	off = sizeof(struct ext2fs_journal_bhdr);
 
 	/* Worst case one tag per 8 bytes; refuse a block that cannot fit. */
@@ -248,6 +250,8 @@ ext2_journal_desc_scan(struct ext2_journal *j, const void *buf, size_t len,
 		}
 
 		tags[n].jt_blocknr = blocknr;
+		tags[n].jt_sequence = bh.bh_sequence;
+		memcpy(tags[n].jt_seq_be, p + 0x08, sizeof(tags[n].jt_seq_be));
 		tags[n].jt_flags = flags;
 		tags[n].jt_checksum = csum;
 		if (flags & EXT2_JOURNAL_TAG_SAME_UUID) {
@@ -345,26 +349,218 @@ ext2_journal_revoke_scan(struct ext2_journal *j, const void *buf, size_t len,
 }
 
 /*
- * Journal checksum.
+ * Journal checksums.
  *
- * Only CRC32C and CRC32 are implemented; they are the two the
- * documentation describes as likely and the only ones this filesystem
- * needs, since ext2fs already uses CRC32C for its own metadata
- * checksums.  An algorithm we cannot compute must not be approximated,
- * so it is refused.
+ * Coverage differs per structure, and so does the algorithm, so these are
+ * separate functions rather than one helper with flags.  Getting the
+ * coverage wrong is worse than having no checksum: the two commit-block
+ * rules are mutually exclusive and selected by feature bits, and applying
+ * the wrong one rejects valid journals.
+ *
+ * Every algorithm here is seeded with the journal UUID, so a checksum
+ * from one journal does not validate against another.
+ *
+ * CRC32C is the only algorithm implemented.  It is what this filesystem
+ * already uses for its metadata checksums, and the documentation names
+ * it as likely.  The digest types and plain CRC32 are refused rather
+ * than approximated: returning a value we cannot verify would let a
+ * corrupt journal pass as a clean one.
  */
-uint32_t
-ext2_journal_checksum(struct ext2_journal *j, uint32_t seed, const void *buf,
+
+static uint32_t
+ext2_journal_csum_seed(const struct ext2_journal *j)
+{
+
+	return (calculate_crc32c(~0, j->j_uuid, sizeof(j->j_uuid)));
+}
+
+int
+ext2_journal_csum_usable(const struct ext2_journal *j)
+{
+
+	return (j->j_checksum_type == EXT2_JOURNAL_CRC32C);
+}
+
+/*
+ * Does the journal advertise per-block checksums at all?
+ */
+int
+ext2_journal_csum_blocks(const struct ext2_journal *j)
+{
+
+	return ((j->j_feature_incompat &
+	    (EXT2_JOURNAL_INCOMPAT_CSUM_V2 | EXT2_JOURNAL_INCOMPAT_CSUM_V3)) != 0);
+}
+
+/*
+ * Compute a checksum over one buffer, seeded with the journal UUID.
+ * Returns an errno rather than a value when the algorithm is not one we
+ * can compute.
+ */
+int
+ext2_journal_csum(const struct ext2_journal *j, const void *buf, size_t len,
+    uint32_t *out)
+{
+
+	if (!ext2_journal_csum_usable(j))
+		return (ENOTSUP);
+	*out = calculate_crc32c(ext2_journal_csum_seed(j), buf, len);
+	return (0);
+}
+
+/*
+ * Superblock checksum: the whole 1024-byte structure with the checksum
+ * field itself taken as zero.
+ */
+int
+ext2_journal_sb_csum_verify(struct ext2_journal *j, const void *buf, size_t len)
+{
+	uint8_t sb[EXT2_JOURNAL_SB_SIZE];
+	uint32_t want, got;
+	int error;
+
+	if (len < EXT2_JOURNAL_SB_SIZE)
+		return (EINVAL);
+	if (!ext2_journal_csum_usable(j))
+		return (ENOTSUP);
+
+	memcpy(sb, buf, EXT2_JOURNAL_SB_SIZE);
+	want = be32dec(sb + 0xfc);
+	be32enc(sb + 0xfc, 0);		/* covered with the field zeroed */
+
+	error = ext2_journal_csum(j, sb, EXT2_JOURNAL_SB_SIZE, &got);
+	if (error)
+		return (error);
+	return (got == want ? 0 : EBADMSG);
+}
+
+/*
+ * Descriptor and revoke tails: the UUID plus the whole block, with the
+ * tail field itself zeroed.
+ */
+static int
+ext2_journal_tail_csum_verify(struct ext2_journal *j, const void *buf,
+    size_t len, size_t tailoff)
+{
+	uint8_t *tmp;
+	uint32_t want, got;
+	int error;
+
+	if (len < tailoff + 4)
+		return (EINVAL);
+	if (!ext2_journal_csum_usable(j))
+		return (ENOTSUP);
+
+	want = be32dec((const uint8_t *)buf + tailoff);
+
+	tmp = malloc(len, M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (tmp == NULL)
+		return (ENOMEM);
+	memcpy(tmp, buf, len);
+	be32enc(tmp + tailoff, 0);
+
+	error = ext2_journal_csum(j, tmp, len, &got);
+	free(tmp, M_EXT2JOURNAL);
+	if (error)
+		return (error);
+	return (got == want ? 0 : EBADMSG);
+}
+
+int
+ext2_journal_desc_csum_verify(struct ext2_journal *j, const void *buf,
     size_t len)
 {
 
-	switch (j->j_checksum_type) {
-	case EXT2_JOURNAL_CRC32C:
-		return (calculate_crc32c(seed, buf, len));
-	case EXT2_JOURNAL_CRC32:
-		/* Not implemented in this phase; refuse rather than guess. */
+	if (!ext2_journal_csum_blocks(j))
+		return (0);		/* no per-block checksums advertised */
+	return (ext2_journal_tail_csum_verify(j, buf, len, len - 4));
+}
+
+int
+ext2_journal_revoke_csum_verify(struct ext2_journal *j, const void *buf,
+    size_t len, size_t tailoff)
+{
+
+	if (!ext2_journal_csum_blocks(j))
 		return (0);
-	default:
-		return (0);
+	return (ext2_journal_tail_csum_verify(j, buf, len, tailoff));
+}
+
+/*
+ * Descriptor tag checksum: the UUID, then the transaction sequence,
+ * then the data block itself.
+ *
+ * Under the classic encoding only the low 16 bits of the result are
+ * stored, so that is what is compared.  Getting that wrong rejects every
+ * classic tag whose checksum has bit 15 set.
+ */
+int
+ext2_journal_tag_csum_verify(struct ext2_journal *j,
+    const struct ext2_journal_tag *tag, const void *databuf, size_t datalen,
+    int csum3)
+{
+	uint32_t crc, want;
+
+	if (!ext2_journal_csum_usable(j))
+		return (ENOTSUP);
+
+	/*
+	 * The sequence is hashed as the four big-endian bytes it occupies
+	 * on disk, not as a decoded host-order value.  Hashing the decoded
+	 * form would not match what produced the tag.
+	 */
+	crc = ext2_journal_csum_seed(j);
+	crc = calculate_crc32c(crc, tag->jt_seq_be, sizeof(tag->jt_seq_be));
+	crc = calculate_crc32c(crc, databuf, datalen);
+
+	if (csum3) {
+		want = tag->jt_checksum;
+		return (crc == want ? 0 : EBADMSG);
 	}
+	want = tag->jt_checksum & 0xffff;
+	return ((crc & 0xffff) == want ? 0 : EBADMSG);
+}
+
+/*
+ * Commit block checksum.
+ *
+ * Two mutually exclusive rules, selected by feature bits:
+ *
+ *   CSUM_V2 or CSUM_V3	set - the UUID plus the whole commit block, with
+ *				the first checksum word taken as zero
+ *   COMPAT_CHECKSUM only	- a CRC32 of every block written so far in
+ *				the transaction, which is not a property of this
+ *				block and is verified against the transaction
+ *				as a whole
+ *
+ * Only the first is verifiable from the commit block alone.
+ */
+int
+ext2_journal_commit_csum_verify(struct ext2_journal *j, const void *buf,
+    size_t len)
+{
+	uint8_t *tmp;
+	uint32_t want, got;
+	int error;
+
+	if (!ext2_journal_csum_blocks(j))
+		return (ENOTSUP);	/* COMPAT_CHECKSUM-only: see above */
+	if (len < sizeof(struct ext2fs_journal_commit))
+		return (EINVAL);
+	if (!ext2_journal_csum_usable(j))
+		return (ENOTSUP);
+
+	want = be32dec((const uint8_t *)buf + 0x10);
+
+	tmp = malloc(len, M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (tmp == NULL)
+		return (ENOMEM);
+	memcpy(tmp, buf, len);
+	be32enc(tmp + 0x10, 0);		/* first word covered as zero */
+
+	error = ext2_journal_csum(j, tmp, len, &got);
+	free(tmp, M_EXT2JOURNAL);
+	if (error)
+		return (error);
+	return (got == want ? 0 : EBADMSG);
 }
