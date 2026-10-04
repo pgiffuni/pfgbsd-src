@@ -325,7 +325,7 @@ things.
 
 | What | Coverage | Field zeroed during computation |
 |---|---|---|
-| journal superblock | the entire 1024-byte structure | `s_checksum` at 0xFC |
+| journal superblock | the entire 1024-byte structure, **no UUID** | `s_checksum` at 0xFC |
 | descriptor block tail | journal UUID + the descriptor block | `t_checksum` |
 | data block tag (classic) | journal UUID + sequence number + the data block — **low 16 bits stored** | n/a |
 | data block tag (CSUM_V3) | journal UUID + sequence number + the data block — full 32 bits | n/a |
@@ -335,6 +335,23 @@ things.
 
 The last two rows are mutually exclusive and selected by feature flags,
 not by preference. Both must be implemented to read real images.
+
+**The superblock row is not like the others, and getting it wrong rejects
+every journal.** Verified against a superblock written by a real
+implementation: the stored value is `crc32c(0, sb, 1024)` under Linux's
+`crc32c()`, which xors on entry and **not** on exit. FreeBSD's
+`calculate_crc32c()` xors on both, so the equivalent here is its result
+inverted:
+
+```
+sb_csum = calculate_crc32c(0, sb, 1024) ^ 0xFFFFFFFF
+```
+
+No UUID is mixed in. The superblock already carries it at 0x30, so
+seeding with it would cover those bytes twice. The descriptor, data,
+revoke and commit checksums do take the UUID; the superblock does not.
+This is exactly the kind of detail that documentation alone does not
+settle, and it was wrong here until a real superblock was checked.
 
 Note the asymmetry worth getting wrong deliberately: with CSUM_V2/V3 the
 commit checksum covers the commit block itself; with only
