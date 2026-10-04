@@ -978,6 +978,21 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp)
 	 * Read-only mounts skip it and report instead, since replaying
 	 * writes.
 	 */
+	/*
+	 * Publish the block geometry before anything that can map a block
+	 * number.  ext2fs statfs() normally fills these in, but it runs
+	 * after mount, and mapping the journal inode's first block goes
+	 * through the indirect-block machinery, which sizes its buffers
+	 * from mnt_stat.f_iosize.  Reading it before it is set is how the
+	 * earlier extfs-journaling work went wrong.
+	 */
+	MNT_ILOCK(mp);
+	mp->mnt_stat.f_iosize = EXT2_BLOCK_SIZE(fs);
+	mp->mnt_stat.f_bsize = EXT2_FRAG_SIZE(fs);
+	mp->mnt_stat.f_blocks = fs->e2fs_bcount;
+	mp->mnt_stat.f_bfree = fs->e2fs_fbcount;
+	MNT_IUNLOCK(mp);
+
 	if (ext2_mount_journal(ump, ronly) != 0)
 		goto out;
 	/*

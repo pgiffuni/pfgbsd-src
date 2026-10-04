@@ -1475,14 +1475,18 @@ ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
 		return (ENOMEM);
 	}
 
-	/* Read as raw bytes and convert field by field; never cast. */
-	bp = getblk(ump->um_devvp, (daddr_t)fsbtodb,
-	    (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
-	if (bp == NULL) {
+	/*
+	 * bread(), not getblk(): getblk reserves a buffer but reads nothing,
+	 * so the contents would be whatever the cache happened to hold.
+	 */
+	error = bread(ump->um_devvp, (daddr_t)fsbtodb,
+	    (int)EXT2_JOURNAL_SB_SIZE, NOCRED, &bp);
+	if (error) {
 		free(j->j_sb, M_EXT2JOURNAL);
 		free(j, M_EXT2JOURNAL);
-		return (ENOMEM);
+		return (error);
 	}
+	j->j_sbblock = sbphys;
 	memcpy(j->j_sb, bp->b_data, EXT2_JOURNAL_SB_SIZE);
 	brelse(bp);
 
@@ -1696,7 +1700,13 @@ ext2_journal_write_sb(struct ext2_journal *j)
 		    calculate_crc32c(0, sb, EXT2_JOURNAL_SB_SIZE) ^ 0xFFFFFFFF);
 	}
 
-	bp = getblk(ump->um_devvp, 0, (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
+	/*
+	 * Where it was read from.  Block 0 of the device is the
+	 * filesystem superblock; writing a journal superblock over it
+	 * would destroy the filesystem.
+	 */
+	bp = getblk(ump->um_devvp, (daddr_t)j->j_sbblock,
+	    (int)EXT2_JOURNAL_SB_SIZE, 0, 0, 0);
 	if (bp == NULL) {
 		free(sb, M_EXT2JOURNAL);
 		return (ENOMEM);

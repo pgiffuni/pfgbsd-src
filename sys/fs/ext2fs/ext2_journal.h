@@ -312,6 +312,13 @@ struct ext2_journal {
 						 * validity */
 	uint32_t		 j_reclaim;	/* below here is reclaimable */
 	uint32_t		 j_nr_users;
+	/*
+	 * Where the journal superblock actually lives.  For an internal
+	 * journal that is the first block of the journal inode's data,
+	 * which is nowhere near block 0 and moves with the filesystem's
+	 * own allocation.
+	 */
+	e4fs_daddr_t		 j_sbblock;
 	uint8_t			 j_uuid[16];
 	uint32_t		 j_feature_compat;
 	uint32_t		 j_feature_incompat;
