@@ -99,6 +99,7 @@
  * assertions below check.
  */
 #define	EXT2_JOURNAL_CHECKSUM_BYTES	32
+#define	EXT2_JOURNAL_COMMIT_SIZE	0x3c	/* documented extent */
 
 /*
  * On-disk structures.  These are assertion vehicles, not memory layouts:
@@ -185,6 +186,22 @@ struct ext2fs_journal_commit {
 /*
  * Layout assertions.
  *
+ * The conversions read `struct.field`, so the on-disk offsets now depend
+ * on this ABI's idea of struct layout as well as on the format.  That is
+ * a portability liability, not just a tidiness one: a field whose natural
+ * alignment would introduce padding on some target -- the 64-bit commit
+ * timestamp is the obvious candidate -- would shift every field after it,
+ * and the parser would then read the wrong bytes without complaint.
+ *
+ * Asserting both the size and every field offset turns that into a build
+ * failure on any platform where the layout disagrees, which is the only
+ * place it can be caught: the code here has never read a journal.
+ *
+ * be32toh()/htobe32() are the host-aware conversions, so they are correct
+ * on a big-endian target as well as a little-endian one.  Note that this
+ * is a separate question from be32dec(), which assembles bytes explicitly
+ * and so is host-independent regardless.
+ *
  * Every offset below is checked against the documented format.  This is
  * the only verification available for this code: FreeBSD carries no
  * e2fsprogs, so no journal data can be produced here to test a parser
@@ -254,6 +271,24 @@ EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_padding, 0x0e);
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_chksum, 0x10);
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_commit_sec, 0x30);
 EXT2_J_ASSERT_OFF(struct ext2fs_journal_commit, jc_commit_nsec, 0x38);
+
+_Static_assert(sizeof(struct ext2fs_journal_tag_classic) == 12,
+    "the classic tag prefix is 8 bytes, plus blocknr_high when 64-bit");
+_Static_assert(sizeof(struct ext2fs_journal_desc_tail) == 4,
+    "the descriptor tail is a single 32-bit checksum");
+_Static_assert(sizeof(struct ext2fs_journal_revoke_hdr) == 16,
+    "the revoke header is the block header plus a byte count");
+_Static_assert(sizeof(struct ext2fs_journal_revoke_tail) == 4,
+    "the revoke tail is a single 32-bit checksum");
+/*
+ * The commit header occupies 0x3c bytes.  The structure may be larger
+ * than that -- a trailing uint32_t pads out to the struct's eight-byte
+ * alignment -- so the extent is asserted as a lower bound and the
+ * serialisation copies exactly the documented bytes rather than
+ * sizeof(), which would write four bytes past them.
+ */
+_Static_assert(sizeof(struct ext2fs_journal_commit) >= 0x3c,
+    "the commit header must at least cover its documented 0x3c bytes");
 
 /*
  * Runtime state.  FreeBSD-native, and deliberately not a transliteration
