@@ -107,6 +107,11 @@ else
 	fail=$((fail + 1))
 fi
 
+# The descriptor and commit fixtures are checked by journal-roundtrip.py's
+# offset table plus the coverage recorded in tests/README.md.  They exist
+# because the superblock alone cannot exercise a 32-byte descriptor tag,
+# which is what 64bit|csum_v3 selects.
+
 echo
 if [ "$fail" = 0 ]; then
 	echo "all checks passed"
