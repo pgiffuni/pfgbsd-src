@@ -400,7 +400,6 @@ struct ext2_journal_buf {
 };
 
 /* Writer entry points.  All synchronous in this phase. */
-int	ext2_journal_create(struct ext2mount *, struct m_ext2fs *);
 int	ext2_journal_open_journal(struct ext2mount *, struct m_ext2fs *,
 	    struct ext2_journal **);
 void	ext2_journal_destroy(struct ext2_journal *);
