@@ -282,6 +282,8 @@ struct ext2_journal_tag {
 	uint64_t	jt_blocknr;
 	uint32_t	jt_flags;
 	uint32_t	jt_checksum;
+	uint32_t	jt_sequence;
+	uint8_t		jt_seq_be[4];	/* sequence as it appears on disk */
 	uint8_t		jt_uuid[16];
 	int		jt_has_uuid;
 };
@@ -297,6 +299,57 @@ void	ext2_journal_bhdr_to_disk(void *, const struct ext2fs_journal_bhdr *);
 void	ext2_journal_sb_from_disk(const void *, struct ext2_journal *);
 void	ext2_journal_sb_to_disk(void *, const struct ext2_journal *);
 
+/*
+ * Recovery-time scan state.  Built by the scanner, consumed by replay.
+ *
+ * A revoke is global to the whole replay: the documentation is explicit
+ * that adding a block to a transaction removes any existing revocation
+ * for it, so the table is accumulated across every committed transaction
+ * and consulted for all of them.
+ */
+struct ext2_journal_revoked {
+	uint32_t	jr_blocklo;
+	uint32_t	jr_blockhi;
+	uint32_t	jr_sequence;	/* sequence that last revoked it */
+	STAILQ_ENTRY(ext2_journal_revoked) jr_link;
+};
+
+/* One descriptor tag plus the block it names, as found by the scanner. */
+struct ext2_journal_filedesc {
+	uint64_t	fd_blocknr;	/* where the data goes */
+	uint32_t	fd_jblock;	/* journal block holding the data */
+	uint32_t	fd_flags;
+	uint32_t	fd_sequence;
+	uint32_t	fd_checksum;
+	uint8_t		fd_uuid[16];
+	int		fd_has_uuid;
+	STAILQ_ENTRY(ext2_journal_filedesc) fd_link;
+};
+
+/*
+ * One transaction found by the scanner: the tags of every descriptor
+ * block belonging to it.  A transaction is recoverable only when a commit
+ * block with a matching sequence was seen.
+ */
+struct ext2_journal_trans {
+	uint32_t		tr_sequence;
+	STAILQ_HEAD(, ext2_journal_filedesc) tr_filedescs;
+	int			tr_has_commit;
+	int			tr_committed;
+	int			tr_replayed;	/* recovery bookkeeping */
+	STAILQ_ENTRY(ext2_journal_trans) tr_link;
+};
+
+struct ext2_journal_scan {
+	struct ext2_journal	*sc_journal;
+	uint32_t		 sc_start;	/* first block of the log */
+	uint32_t		 sc_end;	/* one past the last used block */
+	uint32_t		 sc_next_sequence;
+	STAILQ_HEAD(, ext2_journal_trans) sc_trans;
+	STAILQ_HEAD(, ext2_journal_revoked) sc_revoked;
+	int			 sc_error;	/* sticky; fail closed */
+};
+
 /* Format-level entry points.  Implemented in ext2_journal.c. */
 int	ext2_journal_features_ok(uint32_t compat, uint32_t incompat,
 	    uint32_t ro_compat, uint32_t *unsupported);
@@ -307,7 +360,27 @@ int	ext2_journal_desc_scan(struct ext2_journal *j, const void *buf,
 	    size_t len, struct ext2_journal_tag **tagsp, int *ntags);
 int	ext2_journal_revoke_scan(struct ext2_journal *j, const void *buf,
 	    size_t len, uint64_t **blocks, int *nblocks);
-uint32_t ext2_journal_checksum(struct ext2_journal *j, uint32_t seed,
-	    const void *buf, size_t len);
+#define	EXT2_JOURNAL_SB_SIZE	1024
+
+int	ext2_journal_csum_usable(const struct ext2_journal *);
+int	ext2_journal_csum_blocks(const struct ext2_journal *);
+int	ext2_journal_csum(const struct ext2_journal *, const void *, size_t,
+	    uint32_t *);
+int	ext2_journal_sb_csum_verify(struct ext2_journal *, const void *, size_t);
+int	ext2_journal_desc_csum_verify(struct ext2_journal *, const void *,
+	    size_t);
+int	ext2_journal_revoke_csum_verify(struct ext2_journal *, const void *,
+	    size_t, size_t);
+int	ext2_journal_tag_csum_verify(struct ext2_journal *,
+	    const struct ext2_journal_tag *, const void *, size_t, int);
+int	ext2_journal_commit_csum_verify(struct ext2_journal *, const void *,
+	    size_t);
+
+/* Implemented in ext2_journal_recovery.c. */
+int	ext2_journal_scan(struct ext2_journal *, struct ext2_journal_scan *);
+void	ext2_journal_scan_free(struct ext2_journal_scan *);
+int	ext2_journal_recover(struct ext2_journal *);
+int	ext2_journal_revoked_p(struct ext2_journal_scan *, uint64_t,
+	    uint32_t sequence);
 
 #endif /* !_FS_EXT2FS_EXT2_JOURNAL_H_ */
