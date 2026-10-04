@@ -61,6 +61,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_journal.h>
+#include <fs/ext2fs/ext2_softdep.h>
 
 /*
  * Read one journal block.
@@ -362,6 +363,7 @@ ext2_journal_scan_pass(struct ext2_journal *j, struct ext2_journal_scan *sc,
 	}
 
 	*endp = blockno;
+	EXT2_CRASH(EXT2_CRASH_RECOVERY_PASS);
 	return (0);
 }
 
@@ -482,6 +484,7 @@ ext2_journal_replay(struct ext2_journal *j, struct ext2_journal_scan *sc)
 			if (error)
 				return (error);
 			replayed++;
+			EXT2_CRASH(EXT2_CRASH_REPLAY_BLOCK);
 		}
 	}
 
