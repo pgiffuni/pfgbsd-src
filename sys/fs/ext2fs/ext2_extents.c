@@ -46,6 +46,7 @@
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extents.h>
 #include <fs/ext2fs/ext2_extern.h>
+#include <fs/ext2fs/ext2_journal.h>
 #include <fs/ext2fs/ext2_softdep.h>
 
 SDT_PROVIDER_DECLARE(ext2fs);
@@ -823,6 +824,7 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 	if (!path)
 		return (EINVAL);
 
+
 	if (path->ep_data) {
 		blk = path->ep_blk;
 		bp = getblk(ip->i_devvp, fsbtodb(fs, blk),
@@ -1011,6 +1013,25 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 		memmove(ex, path[depth].ep_ext - m,
 		    sizeof(struct ext4_extent) * m);
 		neh->eh_ecount = htole16(le16toh(neh->eh_ecount) + m);
+	}
+
+
+	/*
+	 * The extent tree is the one place Soft Updates has no mechanism
+	 * for: a single mutation can touch the inode, an index block and a
+	 * leaf, and the dependency graph cannot express that relationship
+	 * because it was built around indirect-block chains.
+	 *
+	 * When a transaction is open for this operation the block is
+	 * journalled as well as written; the transaction is what makes the
+	 * whole set recoverable together.  Writing it and journalling it
+	 * are not alternatives, and with no transaction open the Soft
+	 * Updates path is exactly what ran before.
+	 */
+	if (ip->i_ump->um_jtrans != NULL) {
+		error = ext2_journal_dirty_metadata(ip->i_ump->um_jtrans, bp);
+		if (error)
+			return (error);
 	}
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
@@ -2023,6 +2044,18 @@ ext4_reallocblks(struct vop_reallocblks_args *ap)
 	EXT2_UNLOCK(ump);
 
 	/*
+	 * The whole relocation is one operation: a new run, the extent that
+	 * names it, and the release of the old run.  Journalling part of it
+	 * would leave the rest recoverable at a different moment, which is
+	 * worse than not journalling at all, so one transaction spans all
+	 * three.  Soft Updates has no mechanism here, so this is the case
+	 * the journal exists for.
+	 */
+	error = ext2_op_start(ip, 1, len + 4);
+	if (error)
+		goto refuse;
+
+	/*
 	 * Deliberately no ext2_commit_allocated_block() here.  That helper
 	 * charges the new run to i_blocks, and ext2_blkfree() does not credit
 	 * anything back, so committing would inflate i_blocks by the length of
@@ -2032,6 +2065,7 @@ ext4_reallocblks(struct vop_reallocblks_args *ap)
 	 */
 	if (ctx.run.par_length != len) {
 		ext2_rollback_allocation(&ctx);
+		ext2_op_abort(ip);
 		goto refuse;
 	}
 
@@ -2041,9 +2075,21 @@ ext4_reallocblks(struct vop_reallocblks_args *ap)
 	    ctx.run.par_physical_start);
 	if (error) {
 		ext2_rollback_allocation(&ctx);
+		ext2_op_abort(ip);
 		goto refuse;
 	}
-	/* The new run is reachable from the on-disk inode. */
+
+	/*
+	 * The new mapping is on disk but not yet recoverable on its own:
+	 * the commit record is what makes it so.  Publication waits for it,
+	 * which is the whole reason the allocator asks a question instead
+	 * of deciding for itself.
+	 */
+	error = ext2_op_end(ip);
+	if (error) {
+		ext2_rollback_allocation(&ctx);
+		goto refuse;
+	}
 	ext2_alloc_transition(&ctx, EXT2_ALLOC_PUBLISHED);
 
 	SDT_PROBE3(ext2fs, , alloc, ext4_reallocblks_realloc,
