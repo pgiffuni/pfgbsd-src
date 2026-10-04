@@ -359,59 +359,102 @@ ext2_i2ei(struct inode *ip, struct ext2fs_dinode *ei)
  * reach a field.
  */
 
+/*
+ * Journal conversions.
+ *
+ * The journal is big-endian and the metadata around it is little-endian,
+ * so these do not reuse any le* helper.  Each field is converted
+ * explicitly with be32toh()/htobe32().
+ *
+ * The structure below is the single source of truth for the layout: the
+ * code reads struct fields, and the _Static_asserts in ext2_journal.h
+ * check those fields' offsets against the documented format.  Reading
+ * hand-written offsets here instead would make the assertions and the
+ * code independent, so a change to one could leave the other reading the
+ * wrong field while still passing.
+ *
+ * The buffer is copied into the structure rather than cast onto it, so
+ * this is not a strict-aliasing violation, and the result is written back
+ * the same way.
+ */
 void
 ext2_journal_bhdr_from_disk(const void *buf, struct ext2fs_journal_bhdr *bh)
 {
+	struct ext2fs_journal_bhdr disk;
 
-	bh->bh_magic = be32dec((const uint8_t *)buf + 0x00);
-	bh->bh_type = be32dec((const uint8_t *)buf + 0x04);
-	bh->bh_sequence = be32dec((const uint8_t *)buf + 0x08);
+	memcpy(&disk, buf, sizeof(disk));
+
+	bh->bh_magic = be32toh(disk.bh_magic);
+	bh->bh_type = be32toh(disk.bh_type);
+	bh->bh_sequence = be32toh(disk.bh_sequence);
 }
 
 void
 ext2_journal_bhdr_to_disk(void *buf, const struct ext2fs_journal_bhdr *bh)
 {
+	struct ext2fs_journal_bhdr disk;
 
-	be32enc((uint8_t *)buf + 0x00, bh->bh_magic);
-	be32enc((uint8_t *)buf + 0x04, bh->bh_type);
-	be32enc((uint8_t *)buf + 0x08, bh->bh_sequence);
+	disk.bh_magic = htobe32(bh->bh_magic);
+	disk.bh_type = htobe32(bh->bh_type);
+	disk.bh_sequence = htobe32(bh->bh_sequence);
+
+	memcpy(buf, &disk, sizeof(disk));
 }
 
 /*
  * Journal superblock, journal.rst 3.6.4.  The raw block is retained by
- * the caller; this fills in the fields the rest of the code reads and
- * copies out the identity fields.
+ * the caller; this fills in the fields the rest of the code reads.
+ *
+ * checksum_type is one byte in the documented layout, and is converted as
+ * one.  Treating it as 32-bit shifts every field after it, which is how a
+ * reader ends up parsing a superblock whose fast-commit block count is in
+ * the wrong place.
  */
 void
 ext2_journal_sb_from_disk(const void *buf, struct ext2_journal *j)
 {
-	const uint8_t *p = buf;
-	struct ext2fs_journal_bhdr bh;
+	struct ext2fs_journal_sb disk;
+	uint32_t bad;
 
-	ext2_journal_bhdr_from_disk(p, &bh);
-	j->j_feature_compat = be32dec(p + 0x24);
-	j->j_feature_incompat = be32dec(p + 0x28);
-	j->j_feature_ro_compat = be32dec(p + 0x2c);
-	memcpy(j->j_uuid, p + 0x30, sizeof(j->j_uuid));
-	j->j_nr_users = be32dec(p + 0x40);
-	j->j_checksum_type = p[0x50];
-	j->j_blocksize = be32dec(p + 0x0c);
-	j->j_maxlen = be32dec(p + 0x10);
-	j->j_first = be32dec(p + 0x14);
+	memcpy(&disk, buf, sizeof(disk));
+
+	j->j_feature_compat = be32toh(disk.sb_feature_compat);
+	j->j_feature_incompat = be32toh(disk.sb_feature_incompat);
+	j->j_feature_ro_compat = be32toh(disk.sb_feature_ro_compat);
+	j->j_nr_users = be32toh(disk.sb_nr_users);
+	j->j_checksum_type = disk.sb_checksum_type;
+	j->j_blocksize = be32toh(disk.sb_blocksize);
+	j->j_maxlen = be32toh(disk.sb_maxlen);
+	j->j_first = be32toh(disk.sb_first);
+	memcpy(j->j_uuid, disk.sb_uuid, sizeof(j->j_uuid));
+
+	/*
+	 * Refuse here rather than leaving an unsupported feature set for a
+	 * caller to trip over.  A journal we cannot read must not be used.
+	 */
+	if (ext2_journal_features_ok(j->j_feature_compat,
+	    j->j_feature_incompat, j->j_feature_ro_compat, &bad) != 0) {
+		j->j_readonly = 1;
+		j->j_writable = 0;
+	}
 }
 
 void
 ext2_journal_sb_to_disk(void *buf, const struct ext2_journal *j)
 {
-	uint8_t *p = buf;
+	struct ext2fs_journal_sb disk;
 
-	be32enc(p + 0x24, j->j_feature_compat);
-	be32enc(p + 0x28, j->j_feature_incompat);
-	be32enc(p + 0x2c, j->j_feature_ro_compat);
-	memcpy(p + 0x30, j->j_uuid, sizeof(j->j_uuid));
-	be32enc(p + 0x40, j->j_nr_users);
-	p[0x50] = j->j_checksum_type;
-	be32enc(p + 0x0c, j->j_blocksize);
-	be32enc(p + 0x10, j->j_maxlen);
-	be32enc(p + 0x14, j->j_first);
+	memset(&disk, 0, sizeof(disk));
+	disk.sb_header.bh_magic = htobe32(EXT2_JOURNAL_MAGIC);
+	disk.sb_feature_compat = htobe32(j->j_feature_compat);
+	disk.sb_feature_incompat = htobe32(j->j_feature_incompat);
+	disk.sb_feature_ro_compat = htobe32(j->j_feature_ro_compat);
+	memcpy(disk.sb_uuid, j->j_uuid, sizeof(disk.sb_uuid));
+	disk.sb_nr_users = htobe32(j->j_nr_users);
+	disk.sb_checksum_type = j->j_checksum_type;
+	disk.sb_blocksize = htobe32(j->j_blocksize);
+	disk.sb_maxlen = htobe32(j->j_maxlen);
+	disk.sb_first = htobe32(j->j_first);
+
+	memcpy(buf, &disk, sizeof(disk));
 }
