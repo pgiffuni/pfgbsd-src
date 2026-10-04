@@ -1852,8 +1852,6 @@ ext2_fc_scan(const void *buf, size_t len, struct ext2_fc_scan *sc)
 		sc->fcs_records++;
 		if (tag == EXT2_FC_TAG_TAIL)
 			sc->fcs_tail = 1;
-		if (tag == EXT2_FC_TAG_PAD)
-			sc->fcs_pad = 1;
 
 		off += tl.fc_len - sizeof(tl);
 		if (sc->fcs_tail)
