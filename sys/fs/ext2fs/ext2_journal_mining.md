@@ -508,64 +508,90 @@ accumulated across the whole replay scan, not per transaction.
 
 ---
 
-## F. Fast commit — DEFERRED
+## F. Fast commit — mining of what the documentation actually specifies
 
-**No fast-commit writer or replay code is to be written in the JBD2
-phase.** See §O for the decision and the reasoning.
+Re-mined against the current `journal.rst` §3.6.9 and §3.6.10. No GPL
+source was consulted. The outcome is sharper than the earlier "not
+documented": **the model and the semantics are fully specified, and the
+encodings are not.** Those are separable, and worth separating.
 
-What the published documentation does establish:
+### F.1 Fully documented
 
-- The fast-commit area is *"organized as a log of tag length values"*.
-- Each TLV begins with a tag/length pair covering the entire field,
-  followed by a variable-length tag-specific value.
-- The tag set: `HEAD`, `ADD_RANGE`, `DEL_RANGE`, `CREAT`, `LINK`,
-  `UNLINK`, `PAD`, `TAIL`.
-- The value structures are named: `ext4_fc_head`, `ext4_fc_add_range`,
-  `ext4_fc_del_range`, `ext4_fc_dentry_info`, `ext4_fc_tail`.
-- A full JBD2 commit invalidates the fast commits preceding it.
-- Fast commit must be enabled at filesystem creation time.
-- Fast commit is *"a filesystem-specific delta log"* — not merely
-  "journal fewer buffers".
+| Aspect | What §3.6.9/§3.6.10 state |
+|---|---|
+| Framing | "organized as a log of tag length values"; each TLV begins with a tag and "the length of the entire field", followed by a variable-length tag-specific value |
+| Tag set | `HEAD`, `ADD_RANGE`, `DEL_RANGE`, `CREAT`, `LINK`, `UNLINK`, `PAD`, `TAIL` |
+| Semantics of each | HEAD stores "the TID of the transaction after which these fast commits should be applied"; ADD_RANGE stores the inode number and extent to add; DEL_RANGE the inode number and logical offset range to remove; CREAT/LINK/UNLINK the parent inode, inode number and directory entry; TAIL the TID and a CRC of the fast commit |
+| Invalidations | "Once the fast commit area fills in or if fast commit is not possible or if JBD2 commit timer goes off, Ext4 performs a traditional full commit. A full commit invalidates all the fast commits that happened before it and thus it makes the fast commit area empty" |
+| Enablement | "This feature needs to be enabled at mkfs time" |
+| Replay principle | "stores the result of a particular operation instead of storing the procedure"; recovery "needs to *enforce* this state on the filesystem. This is what guarantees idempotence of fast commit replay" |
+| Worked example | the `rm A; mv B A; read A` sequence, and the outcome series that replaces it |
 
-### F.1 What is NOT published
+§3.6.10 is unusually complete as documentation goes: it gives the
+reasoning, the failure it prevents, and the exact transformation. Design
+work — what a fast commit must contain, when it is legal, and what
+recovery must enforce — can be done entirely from this text.
 
-Byte offsets, sizes, numeric tag values, the HEAD TID encoding, the TAIL
-CRC computation, the value-structure layouts, and the replay algorithm.
+### F.2 Documented, but only by derivation
 
-These exist only in GPL Linux source. Implementing them from there would
-violate §1 and §50. They are therefore **not implemented**, and their
-provenance is **not claimed**.
+| Item | Basis | Confidence |
+|---|---|---|
+| Big-endian | "All fields in jbd2 are written to disk in big-endian order", and the fast commit area is part of the journal | high, stated for the journal as a whole |
+| TID is 32 bits | transaction sequences are `__be32` in the block header at 0x8 | high, inferred from a documented field's type |
+| `ext4_fc_tl` is 4 bytes | "stores the tag and the length of the entire field" — two 16-bit fields is the only encoding consistent with eight tags and lengths up to a block | **moderate; this is inference, not documentation** |
 
----
+The third is the only structural assumption, and it is the one the whole
+parser would rest on. It is plausible and self-consistent, but "plausible
+and self-consistent" is not the standard the rest of this document holds
+itself to.
 
-## G. Fast-commit eligibility — DEFERRED
+### F.3 Not specified anywhere in the documentation
 
-Documented: fast commits apply to suitable operations; a full commit is
-performed when fast commit is impossible, when the fast-commit area fills,
-or on the JBD2 commit timer; and a full commit invalidates preceding fast
-commits.
+Nothing at all is given for the five value structures beyond their names
+and one-line descriptions:
 
-Not yet mined: exact per-operation eligibility, extent and directory
-eligibility, transaction and dependency constraints, space rules, and
-fallback triggers.
+| Structure | What §3.6.9 says | What is missing |
+|---|---|---|
+| `ext4_fc_head` | "the TID of the transaction after which these fast commits should be applied" | field widths, whether a checksum is present, padding, endian |
+| `ext4_fc_add_range` | "the inode number and extent to be added in this inode" | inode width; whether "extent" is the documented ext4 extent leaf record reused verbatim, and if so which variant; range length field |
+| `ext4_fc_del_range` | "the inode number and the logical offset range" | both widths, whether length or end offset |
+| `ext4_fc_dentry_info` | "the parent inode number, inode number and directory entry" | all widths, whether the name is inline and how its length is carried |
+| `ext4_fc_tail` | "the TID of the commit, CRC of the fast commit of which this tag represents the end of" | CRC algorithm, what range it covers, whether the TID is that of HEAD or of the full commit that follows |
 
-**Current FreeBSD policy until that is resolved:** every journal-required
-operation uses full JBD2. An extent operation goes to full JBD2, never to
-a guessed fast commit.
+Also unspecified: the numeric values of the eight tags, where inside the
+journal the fast commit area begins, and how HEAD's TID is validated
+during recovery.
 
----
+### F.4 What follows from this
 
-## H. Fast-commit replay — DEFERRED
+The five value structures cannot be implemented from the documentation, and
+deriving them from observed bytes would be fixture-based provenance, which
+§L.4 already flags as a distinct methodology requiring an explicit
+decision.
 
-Documented: replay must be idempotent, and records represent resulting
-state rather than procedure. The `rm A; mv B A` example in the
-documentation shows why — a procedural log replays incorrectly after a
-crash mid-sequence, while an outcome-oriented log converges.
+So fast commit splits cleanly:
 
-That is an architectural requirement and is retained. It is **not** enough
-to implement the binary format. Replay implementation is deferred.
+**Can be built now, from documentation alone**
 
----
+- the TLV framing, with the tag/length encoding identified in F.2 and
+  asserted like every other structure in this filesystem
+- tag dispatch, with an unknown tag refused rather than skipped
+- eligibility, which §3.6.9 states directly: the area is not full, the
+  operation is one the tag set can express, and no commit timer has fired
+- invalidation on full commit, also stated directly
+- the recovery shape §3.6.10 describes: apply records until TAIL, enforce
+  state rather than repeat procedure, and tolerate a partial application
+
+**Cannot be built yet**
+
+- reading or writing any of the five value structures
+- therefore any actual fast commit, on either side
+
+A reader that implements the framing and refuses the values would at
+least be able to walk a fast commit area, validate a TAIL, and decline a
+region it cannot interpret — which is the fail-closed behaviour the rest
+of this filesystem already prefers. That is worth having on its own. It is
+also, on its own, not a fast commit implementation.
 
 ## I. Extent metadata mining
 
