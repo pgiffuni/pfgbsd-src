@@ -31,7 +31,18 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
+#include <net/modbus/modbus.h>
+
+/*
+ * This header is included by userland clients, so it must not pull in the
+ * kernel netgraph.h, which refuses to be used outside the kernel.  A userland
+ * program includes <netgraph.h> from libnetgraph first, which is where the
+ * parse types below come from; the kernel build gets the kernel half here.
+ * This is the arrangement every other node header uses.
+ */
+#ifdef _KERNEL
 #include <netgraph/netgraph.h>
+#endif
 
 /* Node type name, must fit NG_TYPESIZ. */
 #define	NG_MODBUS_NODE_TYPE	"modbus"
