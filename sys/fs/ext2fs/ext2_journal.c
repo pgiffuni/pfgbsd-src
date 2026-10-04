@@ -371,29 +371,83 @@ ext2_journal_revoke_scan(struct ext2_journal *j, const void *buf, size_t len,
 }
 
 /*
- * Journal checksums.
+ * CRC32C, pinned to the semantics the format actually uses.
  *
- * Coverage differs per structure, and so does the algorithm, so these are
- * separate functions rather than one helper with flags.  Getting the
- * coverage wrong is worse than having no checksum: the two commit-block
- * rules are mutually exclusive and selected by feature bits, and applying
- * the wrong one rejects valid journals.
+ * sys/crc32c.c is not present in this tree, so calculate_crc32c()'s
+ * chaining could only be inferred -- and inferred it was, from the
+ * superblock value a real implementation wrote.  The inference is that
+ * calculate_crc32c(c, b, l) xors on entry and on exit, which makes the
+ * stored value calculate_crc32c(0, b, l) with the result inverted.
+ * That single assumption then reproduced all four checksum rules against
+ * real journal blocks, so it is well supported -- but a journal this
+ * filesystem writes should not rest on an assumption about a function it
+ * cannot read.  The primitive is therefore local, and the value it
+ * produces is the one the bytes require rather than the one a library's
+ * convention implies.
  *
- * Every algorithm here is seeded with the journal UUID, so a checksum
- * from one journal does not validate against another.
+ * Xor on entry, no xor on exit.  Every checksum in the journal is this
+ * over a buffer whose first bytes are the journal UUID:
  *
- * CRC32C is the only algorithm implemented.  It is what this filesystem
- * already uses for its metadata checksums, and the documentation names
- * it as likely.  The digest types and plain CRC32 are refused rather
- * than approximated: returning a value we cannot verify would let a
- * corrupt journal pass as a clean one.
+ *	superblock	uuid omitted; the superblock already holds it
+ *	descriptor	uuid + the whole descriptor block, tail zeroed
+ *	commit		uuid + the whole commit block, first word zeroed
+ *	data tag	uuid + sequence + the data block
  */
+#define	EXT2_JOURNAL_CRC32C_POLY	0x82f63b78	/* reflected */
 
-static uint32_t
-ext2_journal_csum_seed(const struct ext2_journal *j)
+static uint32_t ext2_journal_crc32c_tab[256];
+static int ext2_journal_crc32c_ready;
+
+static void
+ext2_journal_crc32c_init(void)
 {
+	uint32_t c;
+	int i, k;
 
-	return (calculate_crc32c(~0, j->j_uuid, sizeof(j->j_uuid)));
+	for (i = 0; i < 256; i++) {
+		c = (uint32_t)i;
+		for (k = 0; k < 8; k++)
+			c = (c & 1) ?
+			    (c >> 1) ^ EXT2_JOURNAL_CRC32C_POLY : c >> 1;
+		ext2_journal_crc32c_tab[i] = c;
+	}
+	ext2_journal_crc32c_ready = 1;
+}
+
+/*
+ * Compute a journal checksum over the journal UUID followed by the given
+ * pieces.  `with_uuid' is cleared only for the superblock.
+ */
+static uint32_t
+ext2_journal_csum_run(const struct ext2_journal *j, int with_uuid,
+    const void *a, size_t alen, const void *b, size_t blen)
+{
+	const uint8_t *p;
+	uint32_t crc;
+	size_t i, len;
+
+	if (!ext2_journal_crc32c_ready)
+		ext2_journal_crc32c_init();
+
+	crc = 0xffffffff;
+	p = j->j_uuid;
+	len = with_uuid ? sizeof(j->j_uuid) : 0;
+	for (i = 0; i < len; i++)
+		crc = (crc >> 8) ^ ext2_journal_crc32c_tab[(crc ^ p[i]) & 0xff];
+
+	if (alen) {
+		p = a;
+		for (i = 0; i < alen; i++)
+			crc = (crc >> 8) ^
+			    ext2_journal_crc32c_tab[(crc ^ p[i]) & 0xff];
+	}
+	if (blen) {
+		p = b;
+		for (i = 0; i < blen; i++)
+			crc = (crc >> 8) ^
+			    ext2_journal_crc32c_tab[(crc ^ p[i]) & 0xff];
+	}
+	return (crc);
 }
 
 int
@@ -426,7 +480,7 @@ ext2_journal_csum(const struct ext2_journal *j, const void *buf, size_t len,
 
 	if (!ext2_journal_csum_usable(j))
 		return (ENOTSUP);
-	*out = calculate_crc32c(ext2_journal_csum_seed(j), buf, len);
+	*out = ext2_journal_csum_run(j, 1, buf, len, NULL, 0);
 	return (0);
 }
 
@@ -460,10 +514,8 @@ ext2_journal_sb_csum_verify(struct ext2_journal *j, const void *buf, size_t len)
 	want = be32dec(sb + 0xfc);
 	be32enc(sb + 0xfc, 0);		/* covered with the field zeroed */
 
-	/*
-	 * Deliberately not ext2_journal_csum(), which seeds with the UUID.
-	 */
-	got = calculate_crc32c(0, sb, EXT2_JOURNAL_SB_SIZE) ^ 0xFFFFFFFF;
+	/* No UUID: the superblock already holds it at 0x30. */
+	got = ext2_journal_csum_run(j, 0, sb, EXT2_JOURNAL_SB_SIZE, NULL, 0);
 	return (got == want ? 0 : EBADMSG);
 }
 
@@ -477,7 +529,6 @@ ext2_journal_tail_csum_verify(struct ext2_journal *j, const void *buf,
 {
 	uint8_t *tmp;
 	uint32_t want, got;
-	int error;
 
 	if (len < tailoff + 4)
 		return (EINVAL);
@@ -490,12 +541,11 @@ ext2_journal_tail_csum_verify(struct ext2_journal *j, const void *buf,
 	if (tmp == NULL)
 		return (ENOMEM);
 	memcpy(tmp, buf, len);
-	be32enc(tmp + tailoff, 0);
+	be32enc(tmp + tailoff, 0);		/* covered with the field zeroed */
 
-	error = ext2_journal_csum(j, tmp, len, &got);
+	/* uuid + the whole block, verified against a real descriptor. */
+	got = ext2_journal_csum_run(j, 1, tmp, len, NULL, 0);
 	free(tmp, M_EXT2JOURNAL);
-	if (error)
-		return (error);
 	return (got == want ? 0 : EBADMSG);
 }
 
@@ -542,9 +592,8 @@ ext2_journal_tag_csum_verify(struct ext2_journal *j,
 	 * on disk, not as a decoded host-order value.  Hashing the decoded
 	 * form would not match what produced the tag.
 	 */
-	crc = ext2_journal_csum_seed(j);
-	crc = calculate_crc32c(crc, tag->jt_seq_be, sizeof(tag->jt_seq_be));
-	crc = calculate_crc32c(crc, databuf, datalen);
+	crc = ext2_journal_csum_run(j, 1, tag->jt_seq_be,
+	    sizeof(tag->jt_seq_be), databuf, datalen);
 
 	if (csum3) {
 		want = tag->jt_checksum;
@@ -574,7 +623,6 @@ ext2_journal_commit_csum_verify(struct ext2_journal *j, const void *buf,
 {
 	uint8_t *tmp;
 	uint32_t want, got;
-	int error;
 
 	if (!ext2_journal_csum_blocks(j))
 		return (ENOTSUP);	/* COMPAT_CHECKSUM-only: see above */
@@ -591,10 +639,9 @@ ext2_journal_commit_csum_verify(struct ext2_journal *j, const void *buf,
 	memcpy(tmp, buf, len);
 	be32enc(tmp + 0x10, 0);		/* first word covered as zero */
 
-	error = ext2_journal_csum(j, tmp, len, &got);
+	/* uuid + the whole block; verified against a real commit record. */
+	got = ext2_journal_csum_run(j, 1, tmp, len, NULL, 0);
 	free(tmp, M_EXT2JOURNAL);
-	if (error)
-		return (error);
 	return (got == want ? 0 : EBADMSG);
 }
 
@@ -906,6 +953,24 @@ ext2_journal_trans_abort(struct ext2_journal_trans *t)
 }
 
 /*
+ * Seal a journal block: compute the checksum the reader will look for and
+ * store it.  `tailoff' is where the checksum lives within the block.
+ */
+static void
+ext2_journal_seal(struct ext2_journal *j, struct buf *bp, size_t tailoff,
+    int with_uuid)
+{
+	uint32_t csum;
+
+	if (!ext2_journal_csum_usable(j) || !ext2_journal_csum_blocks(j))
+		return;
+	be32enc((uint8_t *)bp->b_data + tailoff, 0);
+	csum = ext2_journal_csum_run(j, with_uuid, bp->b_data,
+	    bp->b_bufsize, NULL, 0);
+	be32enc((uint8_t *)bp->b_data + tailoff, csum);
+}
+
+/*
  * Commit.
  *
  * Order is the whole point and is not negotiable:
@@ -930,6 +995,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	struct ext2mount *ump;
 	struct buf *bp;
 	uint32_t ntags, jblock, footprint;
+	uint8_t seqbuf[4];
 	int error;
 
 	if (t == NULL)
@@ -978,6 +1044,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		goto fail;
 	}
 	vfs_bio_clrbuf(bp);
+	be32enc(seqbuf, t->jt_sequence);
 	ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_DESCRIPTOR,
 	    t->jt_sequence);
 	/* Tags follow at offset 12; written by the caller-visible helper. */
@@ -1012,7 +1079,10 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 				tag.t_blocknr = (uint32_t)jb->jb_bp->b_blkno;
 				tag.t_flags = flags;
 				tag.t_blocknr_high = 0;
-				tag.t_checksum = 0;
+				tag.t_checksum = ext2_journal_csum_run(j, 1,
+				    &seqbuf, sizeof(seqbuf),
+				    jb->jb_bp->b_data,
+				    (size_t)j->j_blocksize);
 				memcpy(p, &tag, sizeof(tag));
 				memcpy(p + sizeof(tag), j->j_uuid, 16);
 				p += sz;
@@ -1037,6 +1107,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		}
 	}
 
+	ext2_journal_seal(j, bp, bp->b_bufsize - 4, 1);
 	error = bwrite(bp);
 	if (error)
 		goto fail;
@@ -1126,6 +1197,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 			rh->rh_count = htobe32(count);
 		}
 
+		ext2_journal_seal(j, bp, bp->b_bufsize - 4, 1);
 		error = bwrite(bp);
 		if (error)
 			goto fail;
@@ -1146,6 +1218,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 	EXT2_CRASH(EXT2_CRASH_COMMIT_BEFORE);
 	ext2_journal_write_bhdr(bp, EXT2_JOURNAL_BT_COMMIT,
 	    t->jt_sequence);
+	ext2_journal_seal(j, bp, 0x10, 1);
 	error = bwrite(bp);
 	if (error)
 		goto fail;
