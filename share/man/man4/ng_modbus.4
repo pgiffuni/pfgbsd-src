@@ -254,7 +254,20 @@ missed or measured late, and this implementation makes no real-time claim.
 .Sh TESTS
 The protocol engine and the framings are also covered by a host build under
 .Pa share/tests/modbus ,
-which needs neither netgraph nor hardware.
+which needs neither netgraph nor hardware and is run with
+.Dl bmake run .
+.Pp
+The node itself is covered by
+.Ev "tests/sys/netgraph:ng_modbus" .
+That test needs root, needs the module installed so it can be loaded, and
+runs as part of the FreeBSD test suite:
+.Bd -literal -offset indent
+make -C /usr/src/sys/modules/modbus
+make -C /usr/src/sys/modules/modbus install
+make -C /usr/src/tests install
+kyua test -k /usr/tests/Kyuafile netgraph:ng_modbus
+kyua report
+.Ed
 .Sh SEE ALSO
 .Xr ngctl 8 ,
 .Xr ng_ksocket 4 ,
