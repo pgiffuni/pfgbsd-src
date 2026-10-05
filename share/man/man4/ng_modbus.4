@@ -30,248 +30,151 @@
 .Nm ng_modbus
 .Nd Modbus protocol engine in netgraph
 .Sh SYNOPSIS
+.Nm kldload
+.Ar modbus
 .Nm ngctl
 .Ar create
 .Ar modbus
 .Nm ngctl
 .Ar config
 .Ar modbus
-.Cm setconfig
-.Op Ar role Ar = Ns Ar N
-.Op Ar transport Ar = Ns Ar N
-.Op Ar unit_id Ar = Ns Ar N
+.Cm setconfig role= Ns Ar N transport= Ns Ar N unit_id= Ns Ar N
 .Nm ngctl
 .Ar config
 .Ar modbus
-.Cm request
-.Ar pdu Ar = Ns Ar N
-.Ar pdulen Ar = Ns Ar N
-.Ar unit_id Ar = Ns Ar N
-.Ar tid Ar = Ns Ar N
-.Nm ngctl
-.Ar config
-.Ar modbus
-.Cm setbackend
-.Ar ncoils Ar = Ns Ar N
-.Ar ndiscrete_in Ar = Ns Ar N
-.Ar ninput_regs Ar = Ns Ar N
+.Cm setbackend ncoils= Ns Ar N ndiscrete_in= Ns Ar N ninput_regs= Ns Ar N
 .Ar nholding_regs Ar = Ns Ar N
 .Sh DESCRIPTION
-The
 .Nm
-node type implements a Modbus server or client.
-It registers the type
-.Li modbus
-when the module is loaded and unregisters it when the module is unloaded.
+implements the Modbus protocol as a server or a client.
+Each node is an independent endpoint with its own register map, its own parser
+and, as a client, its own outstanding transaction.
 .Pp
-The protocol engine is independent of the transport.
-Requests are decoded from a request PDU, executed against a register
-backend, and answered with a response PDU;
-Modbus/TCP, RTU and ASCII add only their own framing around it.
+The implementation is a transport neutral core with a framing layer around it.
+A framing turns the bytes of a link into request and response PDUs; the core
+decodes a request, executes it against a register map and builds the response.
+Nothing in the core or in the function code handlers knows which framing
+delivered the request, so one implementation serves TCP, a serial line and a
+test harness alike.
 .Pp
-The node has one hook:
-.Bl -tag -width "lower" -compact
-.It Li lower
-Transport data.
-A peer supplies or receives the framed bytes described by
-.Cm transport .
-.El
+A link carries a byte stream, not messages, so each byte is fed through the
+framing in order.
+The MBAP header of
+.Cm transport=TCP
+delimits a frame and carries its transaction identifier;
+.Cm transport=RTU
+has no length field, so a frame ends when its CRC verifies and 1.5 character
+times of silence discards one that was cut short;
+.Cm transport=ASCII
+is delimited by a colon and CR LF and checked with an LRC;
+.Cm transport=NONE
+and
+.Cm transport=VNET
+carry exactly one bare PDU per item.
+Responses are framed the same way their request arrived.
 .Pp
-Control messages are addressed to the node itself and do not need a hook.
+The data model is the one the specification defines: coils and holding
+registers are readable and writable, discrete inputs and input registers are
+read only, and all four are 16 bit addressable.
+.Pp
+The node has one hook,
+.Li lower ,
+which carries the framed bytes described by
+.Cm transport ;
+control messages go to the node itself and need no hook.
 .Sh CONFIGURATION
 .Bl -tag -width "setconfig" -compact
 .It Cm setconfig role= Ns Ar N transport= Ns Ar N unit_id= Ns Ar N
-Set the role, the framing and the unit identifier.
 .Cm role
-is
-.Dv MODBUS_ROLE_SERVER
-(1) or
-.Dv MODBUS_ROLE_CLIENT
-(2).
+is 1 for a server, which answers requests, or 2 for a client, which issues
+them.
 .Cm transport
-is one of
-.Dv NONE
-(0), which carries one bare PDU per item and exists for testing,
-.Dv VNET
-(1),
-.Dv TCP
-(2), which uses the MBAP header,
-.Dv RTU
-(3), which uses the CRC framing, or
-.Dv ASCII
-(4), which uses the LRC framing.
+is 0 or 1 for a bare PDU, 2 for TCP, 3 for RTU or 4 for ASCII.
 .Cm unit_id
-is this node's address, 0 for broadcast or 1 to 247.
-The specification reserves 248 to 255, and a configuration outside those
-bounds is refused.
+is this node's address, 1 to 247, or 0 for broadcast; the Serial Line guide
+reserves 248 to 255, so identifiers outside that range are refused.
 .It Cm getconfig
 Return the current configuration.
-.It Cm setbackend ncoils= Ns Ar N ndiscrete_in= Ns Ar N ninput_regs= Ns Ar N nholding_regs= Ns Ar N
-Resize the four register areas.
-Each must be between 1 and 4096; a rejected size leaves the existing map
-untouched.
+.It Cm setbackend ncoils= Ns Ar N ndiscrete_in= Ns Ar N ninput_regs= Ns Ar N nholding_regs Ar = Ns Ar N
+Resize the four areas, each between 1 and 4096.
+A refused size leaves the existing map untouched; a resize does not preserve
+contents.
 .It Cm getbackend
 Return the current sizes.
 .It Cm request pdu= Ns Ar N pdulen= Ns Ar N unit_id= Ns Ar N tid= Ns Ar N
 Issue one request as a client.
 .Cm pdu
-is the request PDU, without any framing, and
-.Cm pdulen
-its length.
-.Cm unit_id
-is the slave to address and
-.Cm tid
-the transaction identifier used by Modbus/TCP.
-A request is refused with EBUSY while another is still outstanding.
-.It Cm getresponse
-Return the response of the last client request:
-its state, which is one of idle, pending, done, expired or failed, and the
-response PDU when one was accepted.
-.It Cm getinfo
-Return the ABI version, the maximum PDU size, the largest ADU of the
-framings this build supports, the set of supported framings, and the default
-serial line parameters.
-.It Cm getstats
-Return the counters described in
-.Sx STATISTICS .
-.It Cm clrstats
-Zero the counters.
-.El
-.Sh DATA PATH
-Each item received on the
+is the request PDU without framing.
+It is refused while another request is outstanding, or when the
 .Li lower
-hook is fed to the configured framing one byte at a time, because a TCP
-stream, and a serial line, carry no packet boundaries.
-The framings own no timer: the RTU framing recognises a frame by its CRC, and
-reports the inter-character deadlines it computes for the node to act on.
+hook has no peer.
+.It Cm getresponse
+Return the state of the last transaction, one of idle, pending, done, expired
+or failed, and the response PDU when one was accepted.
+.It Cm getinfo
+Return the ABI version, the maximum PDU and ADU sizes, the supported framings
+and the serial line parameters.
+.It Cm getstats , Cm clrstats
+Return or zero the counters.
+.El
 .Pp
-A request addressed to another unit identifier is ignored.
-A broadcast request, unit identifier zero, is executed but never answered,
-and a node configured with unit identifier zero answers nothing.
-.Pp
-Responses are framed the way the request arrived:
-an MBAP header carrying the request's transaction identifier for
-.Cm transport=TCP ,
-the unit address and the CRC for
-.Cm transport=RTU ,
-and a colon, hexadecimal characters, the LRC and CR LF for
-.Cm transport=ASCII .
-For
-.Cm transport=NONE
-and
-.Cm transport=VNET
-the response is the bare response PDU.
+Control messages carry fixed width fields and a version, and never expose an
+internal structure or a kernel address.
+A request for another unit identifier is ignored; a broadcast request is
+executed but never answered.
 .Sh FUNCTION CODES
-The following function codes are implemented:
-.Bl -tag -width "17 (0x17)" -compact
-.It 1 (0x01)
-Read Coils
-.It 2 (0x02)
-Read Discrete Inputs
-.It 3 (0x03)
-Read Holding Registers
-.It 4 (0x04)
-Read Input Registers
-.It 5 (0x05)
-Write Single Coil
-.It 6 (0x06)
-Write Single Register
-.It 15 (0x0F)
-Write Multiple Coils
-.It 16 (0x10)
-Write Multiple Registers
-.It 22 (0x16)
-Mask Write Register
-.It 23 (0x17)
-Read/Write Multiple Registers
-.El
+1 (0x01) read coils, 2 (0x02) read discrete inputs, 3 (0x03) read holding
+registers, 4 (0x04) read input registers, 5 (0x05) write single coil, 6 (0x06)
+write single register, 15 (0x0F) write multiple coils, 16 (0x10) write multiple
+registers, 22 (0x16) mask write register and 23 (0x17) read/write multiple
+registers.
 .Pp
-Any other function code is answered with exception code 1,
-ILLEGAL FUNCTION.
-Requests that violate a length, quantity or byte count rule are answered with
-exception code 3,
-ILLEGAL DATA VALUE,
-and addresses outside the configured map with exception code 2,
-ILLEGAL DATA ADDRESS.
-The remaining exception codes of the specification are defined but never
-generated by this implementation.
+Each enforces the quantity and byte count limits of its request diagram.
+An unsupported function code is answered with exception 1, an inconsistent
+length, quantity or byte count with exception 3, and an address outside the
+configured map with exception 2.
+An exception is a response on the wire, never a kernel error.
 .Sh STATISTICS
-.Bl -tag -width "rx_frames" -compact
-.It Li rx_frames
-Items received on the lower hook.
-.It Li rx_bytes
-Bytes received on the lower hook.
-.It Li tx_frames
-Response frames transmitted.
-.It Li tx_bytes
-Bytes transmitted.
-.It Li errors
-Malformed frames, CRC and LRC failures, invalid function codes, protocol
-exceptions, allocation failures and rejected items.
-.El
-.Pp
-A client transaction also counts as
-.Dv errors
-when the response cannot be used.
-.It Li timeouts
-Client transactions that expired with no response.
-.El
-.Sh EXAMPLES
-Create a server holding 1024 coils and holding registers, and answer a
-Modbus/TCP peer:
-.Bd -literal -offset indent
-kldload modbus
-ngctl create modbus
-ngctl config modbus setconfig role=1 transport=2 unit_id=1
-ngctl config modbus setbackend ncoils=1024 nholding_regs=1024
-ngctl connect modbus: lower ng_ksocket:inet/stream/tcp/502
-.Ed
-.Pp
-Talk to it over a virtual transport, one PDU per item, from a test harness:
-.Bd -literal -offset indent
-ngctl create modbus
-ngctl config modbus setconfig role=1 transport=1 unit_id=1
-.Ed
+.Cm getstats
+reports items and bytes received, frames and bytes transmitted, errors, and
+expired client transactions.
+Errors are counted rather than logged, so diagnostics cannot become a timing
+problem in the data path.
 .Sh CAVEATS
-The client role issues one request at a time and does not retry.
-A transaction that has no response within
+The client issues one request at a time and never retries; a transaction with
+no usable response within
 .Dv MODBUS_CLIENT_TIMEOUT_MS
-milliseconds is given up and counted in the
-.Li timeouts
-statistic.
+milliseconds is given up.
 .Pp
-No RS-485 direction control is available in the serial drivers, so half
-duplex lines need a transceiver with automatic direction control.
+There is no object dictionary, so no parameter can be discovered or changed
+through SDO and the device identity is fixed.
+The register map is zeroed when a node is created and has no persistence or
+access control.
 .Pp
-RTU framing depends on silence to delimit frames.
-A frame that is still incomplete when the line has been quiet for
-.Ms 3.5
-character times is discarded.
-The character times are computed from the configured baud rate and bits per
-character, and the specification's fixed values are used above 19200 Bd, but a
-software timer is not exact: above 19200 Bd the t3.5 gap of 1.750 ms can be
-missed or measured late, and this implementation makes no real-time claim.
-.Sh TESTS
-The protocol engine and the framings are also covered by a host build under
-.Pa share/tests/modbus ,
-run with
-.Dl make run .
-It needs neither netgraph nor hardware, and nothing outside the tree: the
-engine includes only headers that a host build also has.
+No serial driver offers RS-485 direction control, so a half duplex line needs
+a transceiver that controls direction itself.
+Launch time transmission is not implemented; the fields the specification
+defines are kept for a driver that can schedule a transmission itself, but a
+frame is always sent as soon as the cycle reaches it.
 .Pp
-The node itself is covered by
-.Ev "tests/sys/netgraph:ng_modbus" .
-That test needs root, needs the module installed so it can be loaded, and
-runs as part of the FreeBSD test suite:
-.Bd -literal -offset indent
-make -C /usr/src/sys/modules/modbus
-make -C /usr/src/sys/modules/modbus install
-make -C /usr/src/tests install
-kyua test -k /usr/tests/Kyuafile netgraph:ng_modbus
-kyua report
-.Ed
+RTU framing depends on silence, and a software timer is not exact: above
+19200 Bd the 3.5 character gap of 1.750 ms can be missed or measured late.
+No real-time guarantee is made.
+.Sh STANDARDS
+Behaviour is defined by three documents from the Modbus Organization, published
+at
+.Li https://modbus.org .
+The MODBUS Application Protocol Specification V1.1b3 defines the data model,
+the function codes, the exception codes and the request and response layouts.
+The MODBUS over Serial Line Specification and Implementation Guide V1.02
+defines the unit identifier ranges, the RTU frame with its CRC, the character
+times that delimit it, and the ASCII frame with its LRC.
+The MODBUS Messaging on TCP/IP Implementation Guide V1.0b defines the MBAP
+header and the meaning of its length field.
 .Sh SEE ALSO
+.Xr ng 4 ,
 .Xr ngctl 8 ,
+.Xr ng_ether 4 ,
 .Xr ng_ksocket 4 ,
 .Xr ng_tty 4
 .Sh AUTHORS
