@@ -868,7 +868,7 @@ ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 		return (0);
 
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
-		if (jb->jb_bp->b_blkno == bp->b_blkno)
+		if (jb->jb_blocknr == (uint64_t)bp->b_blkno)
 			return (0);		/* already in this transaction */
 	}
 
@@ -887,7 +887,15 @@ ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 		t->jt_error = ENOMEM;
 		return (ENOMEM);
 	}
-	jb->jb_bp = bp;
+	jb->jb_blocknr = (uint64_t)bp->b_blkno;
+	jb->jb_size = (uint32_t)bp->b_bufsize;
+	jb->jb_data = malloc(jb->jb_size, M_EXT2JOURNAL, M_WAITOK | M_ZERO);
+	if (jb->jb_data == NULL) {
+		free(jb, M_EXT2JOURNAL);
+		t->jt_error = ENOMEM;
+		return (ENOMEM);
+	}
+	memcpy(jb->jb_data, bp->b_data, jb->jb_size);
 	STAILQ_INSERT_TAIL(&t->jt_bufs, jb, jb_link);
 	t->jt_dirty = 1;
 	EXT2_CRASH(EXT2_CRASH_METADATA_ACCESS);
@@ -945,8 +953,10 @@ ext2_journal_trans_abort(struct ext2_journal_trans *t)
 
 	if (t == NULL)
 		return;
-	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
+	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
+		free(jb->jb_data, M_EXT2JOURNAL);
 		free(jb, M_EXT2JOURNAL);
+	}
 	STAILQ_FOREACH(rv, &t->jt_revokes, jr_link)
 		free(rv, M_EXT2JOURNAL);
 	STAILQ_FOREACH(ck, &t->jt_ckpts, ck_link)
@@ -1128,20 +1138,20 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 			if (csum3) {
 				struct ext2fs_journal_tag_csum3 tag;
 
-				tag.t_blocknr = (uint32_t)jb->jb_bp->b_blkno;
+				tag.t_blocknr = (uint32_t)jb->jb_blocknr;
 				tag.t_flags = flags;
 				tag.t_blocknr_high = 0;
 				tag.t_checksum = ext2_journal_csum_run(j, 1,
 				    &seqbuf, sizeof(seqbuf),
-				    jb->jb_bp->b_data,
-				    (size_t)j->j_blocksize);
+				    jb->jb_data,
+				    (size_t)jb->jb_size);
 				memcpy(p, &tag, sizeof(tag));
 				memcpy(p + sizeof(tag), j->j_uuid, 16);
 				p += sz;
 			} else {
 				struct ext2fs_journal_tag_classic tag;
 
-				tag.t_blocknr = (uint32_t)jb->jb_bp->b_blkno;
+				tag.t_blocknr = (uint32_t)jb->jb_blocknr;
 				tag.t_checksum = 0;
 				tag.t_flags = (uint16_t)flags;
 				tag.t_blocknr_high = 0;
@@ -1178,8 +1188,9 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 			goto fail;
 		}
 		vfs_bio_clrbuf(bp);
-		memcpy(bp->b_data, jb->jb_bp->b_data,
-		    (size_t)j->j_blocksize);
+		memset(bp->b_data, 0, (size_t)j->j_blocksize);
+		memcpy(bp->b_data, jb->jb_data,
+		    (size_t)MIN(jb->jb_size, j->j_blocksize));
 		error = bwrite(bp);
 		if (error)
 			goto fail;
@@ -1195,7 +1206,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 			error = ENOMEM;
 			goto fail;
 		}
-		ck->ck_blocknr = (uint64_t)jb->jb_bp->b_blkno;
+		ck->ck_blocknr = jb->jb_blocknr;
 		ck->ck_jblock = jblock;
 		ck->ck_sequence = t->jt_sequence;
 		STAILQ_INSERT_TAIL(&t->jt_ckpts, ck, ck_link);

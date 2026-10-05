@@ -560,8 +560,23 @@ struct ext2_journal_revoke {
 	STAILQ_ENTRY(ext2_journal_revoke) jr_link;
 };
 
+/*
+ * One journalled metadata block.
+ *
+ * The transaction holds a copy of the contents, not the caller's buffer.
+ * The caller writes that buffer home immediately after handing it over,
+ * and a write releases the buffer -- so retaining the pointer would leave
+ * the transaction reading whatever now occupies that memory, which may be
+ * an unrelated block, and copying it into the journal.
+ *
+ * A copy costs one memcpy per journalled block.  An extent operation
+ * journals a handful, so that is a fair price for not having a lifetime
+ * question here at all.
+ */
 struct ext2_journal_buf {
-	struct buf		*jb_bp;
+	uint64_t	jb_blocknr;	/* where the block belongs */
+	uint32_t	jb_size;	/* valid bytes in jb_data */
+	uint8_t		*jb_data;
 	STAILQ_ENTRY(ext2_journal_buf) jb_link;
 };
 
