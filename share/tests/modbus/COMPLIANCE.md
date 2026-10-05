@@ -9,7 +9,7 @@ Column definitions:
 - **spec** — section of MODBUS Application Protocol Specification V1.1b3, or of
   MODBUS over Serial Line Specification V1.02 where marked `ser`.
 - **file:function** — the implementation that owns the behaviour.
-- **test** — the check in `ng_modbus/tests` that exercises it, by name.
+- **test** — the check in this directory that exercises it, by name.
 
 ---
 
