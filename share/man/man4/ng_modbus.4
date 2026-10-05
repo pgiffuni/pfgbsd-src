@@ -251,6 +251,10 @@ The character times are computed from the configured baud rate and bits per
 character, and the specification's fixed values are used above 19200 Bd, but a
 software timer is not exact: above 19200 Bd the t3.5 gap of 1.750 ms can be
 missed or measured late, and this implementation makes no real-time claim.
+.Sh TESTS
+The protocol engine and the framings are also covered by a host build under
+.Pa share/tests/modbus ,
+which needs neither netgraph nor hardware.
 .Sh SEE ALSO
 .Xr ngctl 8 ,
 .Xr ng_ksocket 4 ,
