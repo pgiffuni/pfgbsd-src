@@ -1,7 +1,9 @@
 #
 # Host build of the Modbus protocol tests.
 #
-# Run with bmake: bmake run
+# Run it with make: "make run".  This is a BSD make Makefile, and on a
+# FreeBSD system make(1) is BSD make.  A GNU make on a host system will
+# not understand it.
 #
 # The protocol core under sys/net/modbus is written for the kernel, so this
 # build compiles it against the small shim in shim/ that supplies the few
@@ -20,8 +22,7 @@ TESTCFLAGS=	-std=gnu17 -Wall -Wextra -Wno-unused-parameter -O -g
 
 # The tree root, so this builds from any working directory and from a
 # checkout anywhere.  Override it for an out of tree build, for example
-# "bmake SRCTOP=/usr/src run".  Build with bmake; on FreeBSD /usr/bin/make
-# is bmake.
+# "make SRCTOP=/usr/src run".
 SRCTOP?=	${.CURDIR}/../../..
 MODBUS=		${SRCTOP}/sys/net/modbus
 
