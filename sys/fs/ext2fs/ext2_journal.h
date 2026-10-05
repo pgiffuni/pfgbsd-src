@@ -637,6 +637,21 @@ void	ext2_op_abort(struct inode *);
  * no partial write, because a descriptor without its data is worse than a
  * failed operation.
  *
+ * Two constraints follow from keeping the first implementation simple,
+ * and both are deliberate rather than oversights:
+ *
+ *   - A transaction is not split across the end of the log.  The cursor
+ *     wraps to j_first for the *next* transaction, so one that would only
+ *     fit by wrapping is refused.  The journal is therefore not yet a
+ *     fully general circular allocator, which is the right answer while
+ *     only extent operations journal.
+ *
+ *   - A transaction carries at most one descriptor block's worth of tags,
+ *     and admission refuses it rather than emitting a second.  The
+ *     footprint calculation and the writer must agree: where they
+ *     disagree, the accounting admits a transaction the writer cannot
+ *     represent.
+ *
  * This is deliberately not JBD2's credit and semaphore machinery.  Soft
  * Updates already removes most operations from the journal -- only
  * extent-mapped inodes reach a transaction -- so the journal has to handle

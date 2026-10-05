@@ -773,16 +773,20 @@ uint32_t
 ext2_journal_footprint(struct ext2_journal_trans *t)
 {
 	struct ext2_journal *j = t->jt_journal;
-	uint32_t tags = 0, per_desc, per_revoke, desc, revoke;
+	uint32_t tags = 0, per_revoke, desc, revoke;
 	struct ext2_journal_buf *jb;
 
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link)
 		tags++;
-	per_desc = ext2_journal_tags_per_block(j);
 	per_revoke = ext2_journal_revokes_per_block(j);
 
-	desc = (per_desc && tags) ? (tags + per_desc - 1) / per_desc : 0;
-	desc = desc ? desc : (tags ? 1 : 0);
+	/*
+	 * One descriptor block, because that is what the writer emits and
+	 * what the admission ceiling allows.  Computing a larger figure
+	 * here would let a transaction be admitted that the writer then
+	 * cannot represent.
+	 */
+	desc = tags ? 1 : 0;
 	revoke = (per_revoke && t->jt_nrevoked) ?
 	    (t->jt_nrevoked + per_revoke - 1) / per_revoke : 0;
 
@@ -860,6 +864,7 @@ int
 ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 {
 	struct ext2_journal_buf *jb;
+	uint32_t ntags, per_desc;
 
 	if (t->jt_error)
 		return (t->jt_error);
@@ -867,19 +872,25 @@ ext2_journal_dirty_metadata(struct ext2_journal_trans *t, struct buf *bp)
 	if (bp->b_blkno == 0)
 		return (0);
 
+	ntags = 0;
 	STAILQ_FOREACH(jb, &t->jt_bufs, jb_link) {
 		if (jb->jb_blocknr == (uint64_t)bp->b_blkno)
 			return (0);		/* already in this transaction */
+		ntags++;
 	}
 
 	/*
-	 * A tag array that overruns its descriptor block runs into the
-	 * next block's header, and the whole array is lost rather than one
-	 * tag being wrong.
+	 * One descriptor block holds a bounded number of tags, and the
+	 * writer emits exactly one descriptor block.  A transaction that
+	 * outgrows it is refused here, before anything is written, rather
+	 * than admitted by the footprint calculation and then overrunning
+	 * the block in the writer -- which would run the tag array into the
+	 * next block's header and lose the whole array rather than one tag.
 	 */
-	if (ext2_journal_tags_per_block(t->jt_journal) == 0) {
-		t->jt_error = EINVAL;
-		return (EINVAL);
+	per_desc = ext2_journal_tags_per_block(t->jt_journal);
+	if (per_desc == 0 || ntags >= per_desc) {
+		t->jt_error = ENOSPC;
+		return (ENOSPC);
 	}
 
 	jb = malloc(sizeof(*jb), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
