@@ -91,6 +91,20 @@ ext2_update(struct vnode *vp, int waitfor)
 		brelse(bp);
 		return (error);
 	}
+	/*
+	 * When a journal transaction covers this operation, the inode is
+	 * part of it.  An extent change alters the extent root, the block
+	 * count and the size, so a transaction holding only the tree blocks
+	 * would replay a tree against an inode that never described it.
+	 */
+	if (ip->i_ump->um_jtrans != NULL) {
+		error = ext2_journal_dirty_metadata(ip->i_ump->um_jtrans, bp);
+		if (error) {
+			brelse(bp);
+			return (error);
+		}
+	}
+
 	error = ext2_i2ei(ip, (struct ext2fs_dinode *)((char *)bp->b_data +
 	    EXT2_INODE_SIZE(fs) * ino_to_fsbo(fs, ip->i_number)));
 	if (error) {
