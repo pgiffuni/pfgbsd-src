@@ -31,8 +31,8 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_pdu.h>
+#include "modbus.h"
+#include "modbus_pdu.h"
 
 /*
  * Client side transaction handling.

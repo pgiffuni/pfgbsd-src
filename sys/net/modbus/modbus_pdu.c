@@ -36,11 +36,11 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include "modbus_sys.h"
 #include <sys/errno.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_pdu.h>
+#include "modbus.h"
+#include "modbus_pdu.h"
 
 /*
  * Turn a byte range into a validated PDU view.  The caller keeps ownership
@@ -89,7 +89,7 @@ modbus_pdu_buf_append(struct modbus_pdu_buf *pb, const void *data, size_t len)
 		return (EINVAL);
 
 	if (len != 0)
-		bcopy(data, pb->buf + pb->len, len);
+		memmove(pb->buf + pb->len, data, len);
 	pb->len += (uint16_t)len;
 
 	return (0);

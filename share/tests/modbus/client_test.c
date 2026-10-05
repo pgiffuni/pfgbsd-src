@@ -33,8 +33,8 @@
 #include <errno.h>
 #include <string.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_client.h>
+#include "modbus.h"
+#include "modbus_client.h"
 
 #include "test_util.h"
 

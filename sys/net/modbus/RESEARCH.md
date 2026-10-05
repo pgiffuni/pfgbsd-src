@@ -690,7 +690,7 @@ Do not cache a `node_p` or `hook_p` across any call that can drop a reference
 
 | Layer | Needs | Mechanism |
 |---|---|---|
-| Protocol | nothing | compile the protocol `.c` files into a userland test binary behind a thin shim (malloc/strlcpy/mutex stubs); the protocol files must not include kernel-only headers to keep this honest |
+| Protocol | nothing | `share/tests/modbus`: the protocol sources are compiled as a plain host program, which is why they may not include kernel only headers |
 | Netgraph | netgraph only | ATF + `tests/sys/netgraph` harness (`util.[ch]`: `ng_init/ng_mkpeer/ng_connect/ng_send_data/ng_send_msg/ng_handle_events`), run as root |
 | Transport | no hardware | byte-level unit tests of MBAP/RTU/ASCII state machines, including split/coalesce and timeout cases |
 
@@ -931,6 +931,13 @@ Verification performed:
 - The host build adds `-Wextra`, which the kernel flag set does not use. It
   found a signed comparison in `modbus_pdu_buf_append()` that could have made
   the bounds check meaningless; fixed.
+- The core is compiled outside the kernel as well as inside it: it includes
+  its own headers with quotes, uses `memmove` and `memset` rather than
+  `bcopy`, keeps its allocations behind `modbus_alloc()` because the kernel
+  and the C library take the malloc type and the flags in a different order,
+  and picks the two headers that differ between the two worlds
+  (`<sys/systm.h>` and the byte order helpers) in `modbus_sys.h`.  No shim
+  headers are shipped.
 
 Not verified: no FreeBSD runtime, so the node has still never been loaded, and
 the frameless data path has not been exercised through netgraph.

@@ -38,7 +38,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
-#include <net/modbus/modbus_crc.h>
+#include "modbus_crc.h"
 
 void
 modbus_crc16_update(uint16_t *crc, const uint8_t *buf, size_t len)
