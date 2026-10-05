@@ -902,7 +902,7 @@ sys/net/modbus/modbus_fc.c/.h      01 02 03 04 05 06 0F 10 16 17 + dispatch
 sys/net/modbus/modbus_backend.c/.h memory backed coils/discrete/registers
 sys/net/modbus/modbus.c            modbus_handle(): the transport neutral entry
 sys/netgraph/ng_modbus.c           data path now runs the engine
-ng_modbus/tests/                   host protocol tests, 52 checks
+share/tests/modbus/               host protocol tests
 ```
 
 Protocol surface: PDU parse rejects anything outside 1..253 bytes and any
@@ -919,7 +919,7 @@ testable over plain netgraph without a serial line or TCP.
 
 Verification performed:
 
-- 52 protocol checks pass on the host (`ng_modbus/tests`, `bmake run`): valid
+- The host protocol checks pass (`share/tests/modbus`, `bmake run`): valid
   requests for all ten function codes, the quantity limits from each request
   diagram (2000, 2000, 125, 125, 123, 121), byte count mismatches, truncated
   requests, ranges crossing the end of an area, an out of specification coil
@@ -949,7 +949,7 @@ sys/net/modbus/modbus_crc.c/.h    CRC-16, poly 0xa001, init 0xffff
 sys/net/modbus/modbus_rtu.c/.h    RTU state machine and character times
 sys/net/modbus/modbus_ascii.c/.h  ASCII framing and LRC
 sys/net/modbus/modbus_tcp.c/.h    MBAP stream parser and encoder
-ng_modbus/tests/framing_test.c    framing tests
+share/tests/modbus/framing_test.c framing tests
 ```
 
 Design: each framing is a pure state machine fed one byte at a time with an
@@ -1015,7 +1015,7 @@ Documentation:
 share/man/man4/ng_modbus.4           node, hooks, configuration, function codes,
                                      statistics, examples, caveats
 share/man/man4/Makefile              +1 line
-ng_modbus/COMPLIANCE.md              specification to file:function to test matrix
+share/tests/modbus/COMPLIANCE.md   specification to file:function to test matrix
                                      for every framing rule and function code
 ```
 
