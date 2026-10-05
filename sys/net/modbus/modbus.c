@@ -32,13 +32,13 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include "modbus_sys.h"
 #include <sys/errno.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_backend.h>
-#include <net/modbus/modbus_fc.h>
-#include <net/modbus/modbus_pdu.h>
+#include "modbus.h"
+#include "modbus_backend.h"
+#include "modbus_fc.h"
+#include "modbus_pdu.h"
 
 /*
  * Handle one request PDU.

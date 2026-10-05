@@ -41,10 +41,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_backend.h>
-#include <net/modbus/modbus_fc.h>
-#include <net/modbus/modbus_pdu.h>
+#include "modbus.h"
+#include "modbus_backend.h"
+#include "modbus_fc.h"
+#include "modbus_pdu.h"
 
 #include "test_util.h"
 

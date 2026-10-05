@@ -35,13 +35,13 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include "modbus_sys.h"
 #include <sys/errno.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_backend.h>
-#include <net/modbus/modbus_pdu.h>
-#include <net/modbus/modbus_fc.h>
+#include "modbus.h"
+#include "modbus_backend.h"
+#include "modbus_pdu.h"
+#include "modbus_fc.h"
 
 /* Section 6.5: a coil is written with one of exactly two values. */
 #define	MODBUS_COIL_OFF		0x0000

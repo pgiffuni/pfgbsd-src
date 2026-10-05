@@ -31,12 +31,11 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/endian.h>
+#include "modbus_sys.h"
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_pdu.h>
-#include <net/modbus/modbus_tcp.h>
+#include "modbus.h"
+#include "modbus_pdu.h"
+#include "modbus_tcp.h"
 
 void
 modbus_tcp_init(struct modbus_tcp *tcp)
@@ -169,7 +168,7 @@ modbus_tcp_encode(uint8_t *out, size_t outcap, uint16_t tid, uint8_t unit,
 	modbus_put_u16(out + 2, MODBUS_TCP_MBAP_PROTOCOL);
 	modbus_put_u16(out + 4, (uint16_t)(1 + pdulen));
 	out[6] = unit;
-	bcopy(pdu, out + MODBUS_TCP_MBAPLEN, pdulen);
+	memmove(out + MODBUS_TCP_MBAPLEN, pdu, pdulen);
 
 	return (adulen);
 }

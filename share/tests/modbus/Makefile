@@ -30,7 +30,6 @@ PROG=		modbus_test
 SRCS=		modbus_test.c	\
 		framing_test.c	\
 		client_test.c	\
-		shim_malloc.c	\
 		${MODBUS}/modbus.c		\
 		${MODBUS}/modbus_pdu.c		\
 		${MODBUS}/modbus_fc.c		\
@@ -43,25 +42,21 @@ SRCS=		modbus_test.c	\
 
 CLEANFILES=	${PROG}
 
-# The shim must come first so that <sys/types.h> and friends resolve to it
-# rather than to the kernel headers.  The protocol headers are reached through
-# a generated symlink: shipping one would tie the test build to a relative
-# path in this tree.
-TESTCFLAGS+=	-I shim
+# The engine and these tests include the protocol headers with quotes, so the
+# only include path needed is the directory holding them.  It contains no
+# system headers, so it shadows nothing: a host build still gets the real
+# <sys/param.h>, <sys/malloc.h> and the rest.
+TESTCFLAGS+=	-I ${MODBUS}
 
 all: ${PROG}
 
-shim/net/modbus:
-	@mkdir -p shim/net
-	@ln -sf ${MODBUS} shim/net/modbus
-
-${PROG}: ${SRCS} shim/net/modbus
+${PROG}: ${SRCS}
 	${CC} ${TESTCFLAGS} -o ${PROG} ${SRCS}
 
 run: ${PROG}
 	./${PROG}
 
 clean:
-	rm -f ${CLEANFILES} shim/net/modbus
+	rm -f ${CLEANFILES}
 
 .PHONY: all run clean

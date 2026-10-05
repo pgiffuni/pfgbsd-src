@@ -30,9 +30,9 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
-#include <sys/endian.h>
 
-#include <net/modbus/modbus.h>
+#include "modbus.h"
+#include "modbus_sys.h"
 
 /* Borrowed, validated view of a received PDU. */
 struct modbus_pdu {

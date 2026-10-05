@@ -37,11 +37,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_ascii.h>
-#include <net/modbus/modbus_crc.h>
-#include <net/modbus/modbus_rtu.h>
-#include <net/modbus/modbus_tcp.h>
+#include "modbus.h"
+#include "modbus_ascii.h"
+#include "modbus_crc.h"
+#include "modbus_rtu.h"
+#include "modbus_tcp.h"
 
 #include "test_util.h"
 

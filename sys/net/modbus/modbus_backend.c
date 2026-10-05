@@ -31,16 +31,51 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/kernel.h>
+#include "modbus_sys.h"
 #include <sys/malloc.h>
 #include <sys/errno.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_backend.h>
+#include "modbus.h"
+#include "modbus_backend.h"
 
+#ifdef _KERNEL
+#include <sys/kernel.h>
 static MALLOC_DEFINE(M_MODBUS, "modbus_backend",
     "modbus register storage");
+
+/*
+ * The kernel and the C library take the malloc type and the flags in a
+ * different order, so keep the two calls in one place and let a host build
+ * of this file use the C library allocator directly.
+ */
+static void *
+modbus_alloc(size_t size)
+{
+
+	return (malloc(size, M_MODBUS, M_WAITOK | M_ZERO));
+}
+
+static void
+modbus_free(void *p)
+{
+
+	free(p, M_MODBUS);
+}
+#else
+static void *
+modbus_alloc(size_t size)
+{
+
+	return (malloc(size, M_WAITOK | M_ZERO, NULL));
+}
+
+static void
+modbus_free(void *p)
+{
+
+	free(p, NULL);
+}
+#endif
 
 /*
  * Section 4.4: every area holds at most 65536 items, but a node is
@@ -75,25 +110,22 @@ modbus_backend_init(struct modbus_backend *be,
 		return (EINVAL);
 
 	if (cfg->ncoils != 0) {
-		be->coils = malloc(cfg->ncoils, M_MODBUS, M_WAITOK | M_ZERO);
+		be->coils = modbus_alloc(cfg->ncoils);
 		if (be->coils == NULL)
 			goto nomem;
 	}
 	if (cfg->ndiscrete_in != 0) {
-		be->discrete_in = malloc(cfg->ndiscrete_in, M_MODBUS,
-		    M_WAITOK | M_ZERO);
+		be->discrete_in = modbus_alloc(cfg->ndiscrete_in);
 		if (be->discrete_in == NULL)
 			goto nomem;
 	}
 	if (cfg->ninput_regs != 0) {
-		be->input_regs = malloc(2 * cfg->ninput_regs, M_MODBUS,
-		    M_WAITOK | M_ZERO);
+		be->input_regs = modbus_alloc(2 * cfg->ninput_regs);
 		if (be->input_regs == NULL)
 			goto nomem;
 	}
 	if (cfg->nholding_regs != 0) {
-		be->holding_regs = malloc(2 * cfg->nholding_regs, M_MODBUS,
-		    M_WAITOK | M_ZERO);
+		be->holding_regs = modbus_alloc(2 * cfg->nholding_regs);
 		if (be->holding_regs == NULL)
 			goto nomem;
 	}
@@ -114,10 +146,10 @@ void
 modbus_backend_destroy(struct modbus_backend *be)
 {
 
-	free(be->coils, M_MODBUS);
-	free(be->discrete_in, M_MODBUS);
-	free(be->input_regs, M_MODBUS);
-	free(be->holding_regs, M_MODBUS);
+	modbus_free(be->coils);
+	modbus_free(be->discrete_in);
+	modbus_free(be->input_regs);
+	modbus_free(be->holding_regs);
 	modbus_backend_zero(be);
 }
 

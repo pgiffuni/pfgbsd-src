@@ -31,10 +31,10 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include "modbus_sys.h"
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_ascii.h>
+#include "modbus.h"
+#include "modbus_ascii.h"
 
 /* A frame is a colon, the body in hex pairs, the LRC and CR LF. */
 static const char hexdigits[] = "0123456789ABCDEF";
@@ -201,7 +201,7 @@ modbus_ascii_encode(const uint8_t *in, size_t inlen, uint8_t *out,
 	if (inlen + 1 > MODBUS_RTU_ADU_MAXLEN)
 		return (0);
 
-	bcopy(in, frame, inlen);
+	memmove(frame, in, inlen);
 	lrc = modbus_lrc(frame, inlen);
 	frame[inlen] = lrc;
 

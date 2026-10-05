@@ -31,11 +31,11 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include "modbus_sys.h"
 #include <sys/errno.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_client.h>
+#include "modbus.h"
+#include "modbus_client.h"
 
 void
 modbus_client_reset(struct modbus_client *cl)
@@ -60,7 +60,7 @@ modbus_client_start(struct modbus_client *cl, const uint8_t *pdu,
 	if (pdu == NULL || pdulen == 0 || pdulen > MODBUS_CLIENT_MAX_PDU)
 		return (EINVAL);
 
-	bcopy(pdu, cl->request, pdulen);
+	memmove(cl->request, pdu, pdulen);
 	cl->reqlen = pdulen;
 	cl->unit = unit;
 	cl->tid = tid;
@@ -145,7 +145,7 @@ modbus_client_input(struct modbus_client *cl, const uint8_t *pdu,
 	if (fc != cl->request[0] && fc != (cl->request[0] | MODBUS_FC_MASK))
 		return (MODBUS_CLIENT_IDLE);
 
-	bcopy(pdu, cl->response.buf, pdulen);
+	memmove(cl->response.buf, pdu, pdulen);
 	cl->response.len = pdulen;
 	cl->state = MODBUS_CLIENT_DONE;
 

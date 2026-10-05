@@ -19,6 +19,7 @@ SRCS=	ng_modbus.c				\
 	modbus_ascii.c				\
 	modbus_tcp.c				\
 	modbus.h				\
+	modbus_sys.h			\
 	modbus_pdu.h				\
 	modbus_fc.h				\
 	modbus_client.h			\
