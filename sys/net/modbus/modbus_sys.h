@@ -25,53 +25,52 @@
  * SUCH DAMAGE.
  */
 
-#ifndef _SYS_NET_MODBUS_MODBUS_PDU_H_
-#define	_SYS_NET_MODBUS_MODBUS_PDU_H_
-
-#include <sys/param.h>
-#include <sys/types.h>
-
-#include "modbus.h"
-#include "modbus_sys.h"
-
-/* Borrowed, validated view of a received PDU. */
-struct modbus_pdu {
-	uint8_t		 fc;		/* function code */
-	uint16_t		 len;		/* data length, 0..252 */
-	const uint8_t	*data;		/* pdu + 1 */
-};
-
-/* Owned buffer used to build a response; never exceeds the PDU limit. */
-struct modbus_pdu_buf {
-	uint8_t		 buf[MODBUS_PDU_MAXLEN];
-	uint16_t		 len;
-};
+#ifndef _SYS_NET_MODBUS_MODBUS_SYS_H_
+#define	_SYS_NET_MODBUS_MODBUS_SYS_H_
 
 /*
- * Section 4.2: every quantity travels most significant byte first.  These
- * helpers keep the byte order explicit and work on any addressable buffer,
- * so no packet data is ever cast to a C structure.
+ * The system headers the core needs, which are not the same in a kernel
+ * build and in a host build.
+ *
+ * Two of them exist only in the kernel: <sys/systm.h>, which declares
+ * memmove() and memset(), and the be16dec() and be16enc() of
+ * <sys/endian.h>.  A host build gets the first pair from the C library and
+ * defines the second pair here, identically.  Everything else this directory
+ * includes, <sys/param.h>, <sys/types.h>, <sys/errno.h> and
+ * <sys/malloc.h>, is present in both, so this is the only place that has
+ * to choose.
+ *
+ * This header exists so the protocol core can be compiled and tested
+ * outside the kernel; it declares nothing of its own.
+ */
+
+#ifdef _KERNEL
+#include <sys/systm.h>		/* memmove(), memset() */
+#include <sys/endian.h>		/* be16dec(), be16enc() */
+#else
+#include <string.h>
+
+/*
+ * The kernel's byte order helpers are not in a host <sys/endian.h>, and the
+ * engine only needs sixteen bit big endian, so give it exactly that.  The
+ * definitions are the same as the kernel's: most significant byte first.
  */
 static __inline uint16_t
-modbus_get_u16(const uint8_t *p)
+be16dec(const void *pp)
 {
+	const uint8_t *p = pp;
 
-	return (be16dec(p));
+	return ((uint16_t)((p[0] << 8) | p[1]));
 }
 
 static __inline void
-modbus_put_u16(uint8_t *p, uint16_t v)
+be16enc(void *pp, uint16_t u)
 {
+	uint8_t *p = pp;
 
-	be16enc(p, v);
+	p[0] = (uint8_t)(u >> 8);
+	p[1] = (uint8_t)(u & 0xff);
 }
+#endif
 
-int modbus_pdu_parse(const uint8_t *p, size_t len, struct modbus_pdu *pdu);
-void modbus_pdu_buf_init(struct modbus_pdu_buf *pb);
-int modbus_pdu_buf_set_fc(struct modbus_pdu_buf *pb, uint8_t fc);
-int modbus_pdu_buf_append(struct modbus_pdu_buf *pb, const void *data,
-    size_t len);
-void modbus_pdu_exception(struct modbus_pdu_buf *pb, uint8_t fc,
-    modbus_exc_t exc);
-
-#endif /* _SYS_NET_MODBUS_MODBUS_PDU_H_ */
+#endif /* _SYS_NET_MODBUS_MODBUS_SYS_H_ */

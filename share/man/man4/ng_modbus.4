@@ -254,11 +254,10 @@ missed or measured late, and this implementation makes no real-time claim.
 .Sh TESTS
 The protocol engine and the framings are also covered by a host build under
 .Pa share/tests/modbus ,
-which needs neither netgraph nor hardware and is run with
+run with
 .Dl make run .
-The Makefile is for BSD make, which is
-.Pa make
-in a FreeBSD base system.
+It needs neither netgraph nor hardware, and nothing outside the tree: the
+engine includes only headers that a host build also has.
 .Pp
 The node itself is covered by
 .Ev "tests/sys/netgraph:ng_modbus" .

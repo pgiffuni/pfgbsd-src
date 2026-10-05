@@ -31,11 +31,11 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include "modbus_sys.h"
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_crc.h>
-#include <net/modbus/modbus_rtu.h>
+#include "modbus.h"
+#include "modbus_crc.h"
+#include "modbus_rtu.h"
 
 #define	MODBUS_BAUD_FIXED	19200
 #define	NSEC_PER_SEC		1000000000U

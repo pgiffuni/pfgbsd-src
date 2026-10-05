@@ -31,7 +31,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
-#include <net/modbus/modbus.h>
+#include "modbus.h"
 
 /*
  * RTU framing, section 2.5.1.1 of the MODBUS over Serial Line Specification

@@ -31,7 +31,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
-#include <net/modbus/modbus.h>
+#include "modbus.h"
 
 /*
  * Modbus/TCP framing: an MBAP header followed by the PDU.

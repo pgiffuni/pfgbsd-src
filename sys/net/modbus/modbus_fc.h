@@ -31,9 +31,9 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
-#include <net/modbus/modbus.h>
-#include <net/modbus/modbus_backend.h>
-#include <net/modbus/modbus_pdu.h>
+#include "modbus.h"
+#include "modbus_backend.h"
+#include "modbus_pdu.h"
 
 /*
  * Function codes implemented in this module.  Section numbers refer to the
