@@ -833,6 +833,28 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 			return (EIO);
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
+
+		/*
+		 * Hand the block to the transaction before it reaches its
+		 * home location.  This is the point where the extent
+		 * mutation becomes journalled at all: without it a
+		 * transaction can commit with no copy of the metadata that
+		 * the operation was about, which is the difference between
+		 * a journal and a log of nothing.
+		 *
+		 * The buffer is still written home below.  That is
+		 * deliberate -- the journal is what makes the operation
+		 * atomic, and the home write is what makes it cheap --
+		 * but the commit record is not written until after the
+		 * data blocks, so a crash before it leaves a transaction
+		 * with no commit and nothing replayed, which is recoverable.
+		 */
+		if (ip->i_ump->um_jtrans != NULL) {
+			error = ext2_journal_dirty_metadata(ip->i_ump->um_jtrans,
+			    bp);
+			if (error)
+				return (error);
+		}
 		error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 		if (error) {
 			/*

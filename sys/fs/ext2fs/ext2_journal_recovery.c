@@ -503,6 +503,7 @@ int
 ext2_journal_recover(struct ext2_journal *j)
 {
 	struct ext2_journal_scan sc;
+	uint32_t end;
 	int error, replayed;
 
 	error = ext2_journal_scan(j, &sc);
@@ -512,7 +513,30 @@ ext2_journal_recover(struct ext2_journal *j)
 	}
 
 	replayed = ext2_journal_replay(j, &sc);
-
+	end = sc.sc_end;
 	ext2_journal_scan_free(&sc);
-	return (error ? error : replayed);
+
+	if (error)
+		return (error);
+
+	/*
+	 * Recovery is not finished when replay is done.  Everything up to
+	 * `end' has been written home, so the log start and the cursor both
+	 * move past it -- otherwise the first new transaction begins at
+	 * j_first and overwrites transactions that were just replayed.
+	 *
+	 * The new start block reaches the device before anything uses that
+	 * position: a crash in between would leave a superblock still
+	 * pointing into log we are about to reuse.
+	 */
+	if (end != 0) {
+		j->j_start = end;
+		j->j_cursor = end;
+		j->j_sequence++;
+		error = ext2_journal_write_sb(j);
+		if (error)
+			return (error);
+	}
+
+	return (replayed);
 }

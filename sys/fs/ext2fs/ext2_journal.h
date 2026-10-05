@@ -539,6 +539,14 @@ struct ext2_journal_trans {
 	int			 jt_revoked;	/* revocations queued */
 	uint32_t		 jt_nrevoked;	/* count, for the ceiling */
 	STAILQ_HEAD(, ext2_journal_buf) jt_bufs;
+	/*
+	 * Checkpoint records are held here until the commit record has
+	 * been written.  Publishing them earlier would let a checkpoint
+	 * write back metadata belonging to a transaction that never
+	 * committed, which turns a lost transaction into a corrupt
+	 * filesystem rather than merely an absent one.
+	 */
+	STAILQ_HEAD(, ext2_journal_ckpt) jt_ckpts;
 	STAILQ_HEAD(, ext2_journal_revoke) jt_revokes;
 };
 
