@@ -26,7 +26,7 @@ Deliverable for §62 Phase 1 / §64 of the task statement. Nothing is committed.
    sub-millisecond t1.5/t3.5 gaps (§12, §15).
 5. **This workspace is a pruned FreeBSD tree** (no `sys/kern/Makefile`,
    `sys/kern/kern.mk`, `sys/kern/makesys.mk`, `share/doc/style`, `tools/style`,
-   `sys/amd64/include/machine/`). A working **bmake module build with FreeBSD's
+   `sys/amd64/include/machine/`). A working **BSD make module build with FreeBSD's
    real `-Werror` flag set was validated** (§3.4); linking to `.ko` needs `lld`,
    and `kldload`/`ngctl` testing needs a FreeBSD runtime that this host does not
    have.
@@ -161,7 +161,7 @@ for h in opt_global opt_netgraph opt_kdb opt_platform opt_inet opt_inet6; do
 done
 
 cd sys/modules/modbus
-bmake -m $PWD/share/mk \
+make -m $PWD/share/mk \
       MAKEOBJDIRPREFIX=/tmp/obj KERNBUILDDIR=/tmp/kbdir \
       MACHINE=amd64 MACHINE_CPUARCH=amd64 \
       SYSDIR=$PWD/sys SRCDIR=$PWD/sys KMODDIR=/tmp/modules \
@@ -879,7 +879,8 @@ does apply to inbound items, because `ng_snd_item()` reads the destination node
 
 Verification performed:
 
-- `bmake` module build with FreeBSD's own flags, `-Werror` among them:
+- `bmake` (BSD make, as invoked on a FreeBSD system) module build with the
+  FreeBSD flags, `-Werror` among them:
   **0 errors, 0 warnings**, `ng_modbus.o` produced. Link to `modbus.ko` fails
   only because `lld` is unavailable here (baseline `ng_deflate` fails
   identically), so the object build is the current gate per decision Q1/Q2.
@@ -919,7 +920,7 @@ testable over plain netgraph without a serial line or TCP.
 
 Verification performed:
 
-- The host protocol checks pass (`share/tests/modbus`, `bmake run`): valid
+- The host protocol checks pass (`share/tests/modbus`, `make run`): valid
   requests for all ten function codes, the quantity limits from each request
   diagram (2000, 2000, 125, 125, 123, 121), byte count mismatches, truncated
   requests, ranges crossing the end of an area, an out of specification coil
