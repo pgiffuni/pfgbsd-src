@@ -655,8 +655,6 @@ ext2_journal_commit_csum_verify(struct ext2_journal *j, const void *buf,
  * depends on the operation that started it outliving it.
  */
 
-static uint32_t ext2_journal_next_sequence;
-
 /*
  * Advance the log cursor by n blocks, within [j_first, j_maxlen).
  *
@@ -841,9 +839,10 @@ ext2_journal_trans_start(struct ext2_journal *j, uint32_t nblocks,
 	if (t == NULL)
 		return (ENOMEM);
 	t->jt_journal = j;
-	t->jt_sequence = ext2_journal_next_sequence;
+	t->jt_sequence = j->j_sequence;
 	t->jt_reserved = nblocks;
 	STAILQ_INIT(&t->jt_bufs);
+	STAILQ_INIT(&t->jt_ckpts);
 	STAILQ_INIT(&t->jt_revokes);
 	*tp = t;
 	EXT2_CRASH(EXT2_CRASH_TRANS_START);
@@ -942,6 +941,7 @@ ext2_journal_trans_abort(struct ext2_journal_trans *t)
 {
 	struct ext2_journal_buf *jb;
 	struct ext2_journal_revoke *rv;
+	struct ext2_journal_ckpt *ck;
 
 	if (t == NULL)
 		return;
@@ -949,6 +949,8 @@ ext2_journal_trans_abort(struct ext2_journal_trans *t)
 		free(jb, M_EXT2JOURNAL);
 	STAILQ_FOREACH(rv, &t->jt_revokes, jr_link)
 		free(rv, M_EXT2JOURNAL);
+	STAILQ_FOREACH(ck, &t->jt_ckpts, ck_link)
+		free(ck, M_EXT2JOURNAL);
 	free(t, M_EXT2JOURNAL);
 }
 
@@ -1040,6 +1042,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 {
 	struct ext2_journal_buf *jb;
 	struct ext2_journal_revoke *jr;
+	struct ext2_journal_ckpt *ck;
 	struct ext2_journal *j;
 	struct ext2mount *ump;
 	struct buf *bp;
@@ -1195,7 +1198,7 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		ck->ck_blocknr = (uint64_t)jb->jb_bp->b_blkno;
 		ck->ck_jblock = jblock;
 		ck->ck_sequence = t->jt_sequence;
-		STAILQ_INSERT_TAIL(&j->j_ckpt, ck, ck_link);
+		STAILQ_INSERT_TAIL(&t->jt_ckpts, ck, ck_link);
 		EXT2_CRASH(EXT2_CRASH_DATA_WRITE);
 	}
 
@@ -1289,9 +1292,20 @@ ext2_journal_trans_commit(struct ext2_journal_trans *t)
 		goto fail;
 	EXT2_CRASH(EXT2_CRASH_COMMIT_WRITE);
 
-	/* Past every committed sequence, so the check above holds. */
-	if (t->jt_sequence >= ext2_journal_next_sequence)
-		ext2_journal_next_sequence = t->jt_sequence + 1;
+	/*
+	 * The commit record is on the device, so these blocks are now the
+	 * journal's responsibility: a crash from here is recoverable by
+	 * replay, and a checkpoint may write them home.  Publishing before
+	 * this point would be the opposite.
+	 */
+	while ((ck = STAILQ_FIRST(&t->jt_ckpts)) != NULL) {
+		STAILQ_REMOVE(&t->jt_ckpts, ck, ext2_journal_ckpt, ck_link);
+		STAILQ_INSERT_TAIL(&j->j_ckpt, ck, ck_link);
+	}
+
+	/* The journal owns the sequence; the next transaction follows it. */
+	if (t->jt_sequence >= j->j_sequence)
+		j->j_sequence = t->jt_sequence + 1;
 	ext2_journal_trans_abort(t);
 	return (0);
 
@@ -1359,7 +1373,7 @@ ext2_journal_checkpoint(struct ext2_journal *j)
 		 * whatever is there now would write an unrelated
 		 * transaction's metadata over this block.
 		 */
-		if (ck->ck_sequence > ext2_journal_next_sequence) {
+		if (ck->ck_sequence >= j->j_sequence) {
 			brelse(jbp);
 			return (EINVAL);
 		}
@@ -1461,7 +1475,8 @@ ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
 	error = ext2_journal_first_block(ump, fs, &sbphys);
 	if (error)
 		return (error);
-	fsbtodb = (int)fsbtodb(fs, sbphys);
+	/* first_block() already returned a device block number. */
+	fsbtodb = (int)sbphys;
 
 	j = malloc(sizeof(*j), M_EXT2JOURNAL, M_WAITOK | M_ZERO);
 	if (j == NULL)
@@ -1509,6 +1524,13 @@ ext2_journal_open_journal(struct ext2mount *ump, struct m_ext2fs *fs,
 		goto fail;
 	}
 
+	/*
+	 * The cursor starts at the first block still in use, which is
+	 * j_first on a freshly created journal and the block after the last
+	 * replayed transaction otherwise.  Initialising it to j_first
+	 * unconditionally would let the first new transaction overwrite
+	 * transactions recovery had just replayed.
+	 */
 	j->j_cursor = j->j_first;
 	STAILQ_INIT(&j->j_ckpt);
 	mtx_init(&j->j_lock, "ext2fs journal", MTX_DEF, 0);
@@ -1711,8 +1733,12 @@ ext2_journal_write_sb(struct ext2_journal *j)
 		free(sb, M_EXT2JOURNAL);
 		return (ENOMEM);
 	}
-	memcpy(bp->b_data, sb, EXT2_JOURNAL_SB_SIZE);
+	/*
+	 * Clear first, copy second.  vfs_bio_clrbuf() wipes the buffer, so
+	 * doing it afterwards discards the superblock and writes zeroes.
+	 */
 	vfs_bio_clrbuf(bp);
+	memcpy(bp->b_data, sb, EXT2_JOURNAL_SB_SIZE);
 	EXT2_CRASH(EXT2_CRASH_SB_BEFORE);
 	error = bwrite(bp);
 	free(sb, M_EXT2JOURNAL);
