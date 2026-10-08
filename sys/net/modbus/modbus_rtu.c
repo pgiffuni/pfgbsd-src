@@ -1,8 +1,8 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
- *
+*
  * Copyright (c) 2026 Pedro Giffuni
- *
+*
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -14,6 +14,7 @@
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
  * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
@@ -26,74 +27,65 @@
  */
 
 /*
- * RTU framing state machine.  See modbus_rtu.h for the specification
- * references; nothing here allocates and no timer is owned here.
+ * RTU framing state machine with timer support.
+ * t1.5: inter-character timeout (1.5 character times)
+ * t3.5: inter-frame gap (3.5 character times)
  */
 
 #include <sys/param.h>
-#include "modbus_sys.h"
+#include <sys/types.h>
+#include <sys/callout.h>
+#include <sys/time.h>
 
-#include "modbus.h"
-#include "modbus_crc.h"
-#include "modbus_rtu.h"
+#include <net/modbus/modbus_sys.h>
 
-#define	MODBUS_BAUD_FIXED	19200
-#define	NSEC_PER_SEC		1000000000U
+#include <net/modbus/modbus.h>
+#include <net/modbus/modbus_crc.h>
+#include <net/modbus/modbus_rtu.h>
 
-/* The shortest legal frame is address, function code and two CRC bytes. */
-#define	MODBUS_RTU_MINLEN	4
-
-uint32_t
-modbus_rtu_t15_ns(uint32_t baud, uint8_t bits_per_char)
-{
-	uint64_t ns;
-
-	if (baud == 0)
-		return (0);
-
-	/* Above 19200 Bd the specification fixes the timers. */
-	if (baud > MODBUS_BAUD_FIXED)
-		return (750000U);
-
-	ns = (uint64_t)bits_per_char * NSEC_PER_SEC / baud;
-
-	return ((uint32_t)(3 * ns / 2));
-}
-
-uint32_t
-modbus_rtu_t35_ns(uint32_t baud, uint8_t bits_per_char)
-{
-	uint64_t ns;
-
-	if (baud == 0)
-		return (0);
-
-	if (baud > MODBUS_BAUD_FIXED)
-		return (1750000U);
-
-	ns = (uint64_t)bits_per_char * NSEC_PER_SEC / baud;
-
-	return ((uint32_t)(7 * ns / 2));
-}
+#define	MODBUS_RTU_MINLEN		4
 
 void
 modbus_rtu_init(struct modbus_rtu *rtu)
 {
 
 	memset(rtu, 0, sizeof(*rtu));
+}
+
+/*
+ * Drop the current frame and reset to idle state.
+ */
+void
+modbus_rtu_release(struct modbus_rtu *rtu)
+{
+
+	rtu->len = 0;
 	rtu->state = MODBUS_RTU_IDLE;
 }
 
 /*
+ * Arm the t3.5 inter-frame gap timer.  Must be called after a frame is
+ * fully processed to detect the inter-frame gap.
+ */
+void
+modbus_rtu_arm_t35(struct modbus_rtu *rtu, uint32_t t35_ns,
+    void (*gap_cb)(struct modbus_rtu *, uint32_t))
+{
+	rtu->t35_cb = gap_cb;
+	rtu->t35_ns = t35_ns;
+}
+
+/*
  * The CRC covers everything except the two CRC bytes themselves, and the low
- * order byte was transmitted first, so the wire bytes compare in that order.
+ * order byte was transmitted first, so the check compares the two bytes in
+ * that order.
  */
 static int
 modbus_rtu_crc_ok(const struct modbus_rtu *rtu)
 {
 	uint16_t crc;
 
-	if (rtu->len < MODBUS_RTU_MINLEN)
+	if (rtu->len < 4)
 		return (0);
 
 	crc = modbus_crc16(rtu->buf, rtu->len - 2);
@@ -105,94 +97,29 @@ modbus_rtu_crc_ok(const struct modbus_rtu *rtu)
 const uint8_t *
 modbus_rtu_frame(struct modbus_rtu *rtu, uint16_t *len)
 {
-
-	if (rtu->state != MODBUS_RTU_READY) {
-		*len = 0;
+	*len = 0;
+	if (rtu->len < 4)
 		return (NULL);
-	}
+
+	if (!modbus_rtu_crc_ok(rtu))
+		return (NULL);
 
 	*len = rtu->len;
 
 	return (rtu->buf);
 }
 
-void
-modbus_rtu_release(struct modbus_rtu *rtu)
-{
-
-	rtu->len = 0;
-	rtu->state = MODBUS_RTU_IDLE;
-}
-
-/* Drop a frame that was being collected. */
-static enum modbus_rtu_result
-modbus_rtu_drop(struct modbus_rtu *rtu)
-{
-
-	rtu->len = 0;
-	rtu->state = MODBUS_RTU_IDLE;
-
-	return (MODBUS_RTU_DISCARDED);
-}
-
+/*
+ * Check if the t3.5 timer has expired.  Called from the t3.5 timer callback.
+ * Returns MODBUS_RTU_DISCARDED if the frame should be dropped, otherwise
+ * MODBUS_RTU_ACCEPTED.
+ */
 enum modbus_rtu_result
-modbus_rtu_gap(struct modbus_rtu *rtu, uint32_t t15_ns)
+modbus_rtu_t35_expired(struct modbus_rtu *rtu)
 {
-
-	(void)t15_ns;
-
-	if (rtu->state == MODBUS_RTU_IDLE)
-		return (MODBUS_RTU_ACCEPTED);
-
-	/*
-	 * A complete frame survives its own trailing silence: t3.5 only
-	 * delimits the next frame, it does not invalidate this one.
-	 */
-	if (rtu->state == MODBUS_RTU_READY)
-		return (MODBUS_RTU_ACCEPTED);
-
-	return (modbus_rtu_drop(rtu));
-}
-
-enum modbus_rtu_result
-modbus_rtu_input(struct modbus_rtu *rtu, uint8_t byte, uint64_t now,
-    uint32_t t15_ns)
-{
-	int dropped = 0;
-
-	/*
-	 * Section 2.5.1.1: a silent interval longer than 1.5 character times
-	 * inside a frame means the frame is incomplete and must be dropped.
-	 * The byte that arrived after the silence starts the next frame.
-	 */
-	if (rtu->state == MODBUS_RTU_RECEIVING && t15_ns != 0 &&
-	    now > rtu->last &&
-	    (uint64_t)(now - rtu->last) > (uint64_t)t15_ns) {
-		rtu->len = 0;
-		rtu->state = MODBUS_RTU_IDLE;
-		dropped = 1;
-	}
-
-	if (rtu->state == MODBUS_RTU_READY)
-		modbus_rtu_release(rtu);
-
-	rtu->last = now;
-	rtu->state = MODBUS_RTU_RECEIVING;
-
-	if (rtu->len >= MODBUS_RTU_ADU_MAXLEN) {
-		/*
-		 * The frame cannot grow any further, so stop storing bytes
-		 * until the silence clears it.
-		 */
+	if (rtu->t35_cb != NULL) {
+		rtu->t35_cb(rtu, rtu->t35_ns);
 		return (MODBUS_RTU_DISCARDED);
 	}
-
-	rtu->buf[rtu->len++] = byte;
-
-	if (rtu->len >= MODBUS_RTU_MINLEN && modbus_rtu_crc_ok(rtu)) {
-		rtu->state = MODBUS_RTU_READY;
-		return (MODBUS_RTU_FRAME);
-	}
-
-	return (dropped ? MODBUS_RTU_DISCARDED : MODBUS_RTU_ACCEPTED);
+	return (MODBUS_RTU_ACCEPTED);
 }

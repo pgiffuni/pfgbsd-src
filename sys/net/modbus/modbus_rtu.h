@@ -63,6 +63,8 @@ struct modbus_rtu {
 	uint16_t	len;		/* bytes stored so far */
 	uint64_t	last;		/* timestamp of the last byte */
 	uint8_t		state;		/* enum modbus_rtu_state */
+	void		(*t35_cb)(struct modbus_rtu *, uint32_t);
+	uint32_t	t35_ns;
 };
 
 /*
@@ -93,5 +95,16 @@ enum modbus_rtu_result modbus_rtu_gap(struct modbus_rtu *, uint32_t t15_ns);
  */
 const uint8_t *modbus_rtu_frame(struct modbus_rtu *, uint16_t *len);
 void modbus_rtu_release(struct modbus_rtu *);
+
+/*
+ * Arm the t3.5 inter-frame gap timer.
+ */
+void modbus_rtu_arm_t35(struct modbus_rtu *, uint32_t t35_ns,
+    void (*gap_cb)(struct modbus_rtu *, uint32_t));
+
+/*
+ * Check if the t3.5 timer has expired.  Called from the t3.5 timer callback.
+ */
+enum modbus_rtu_result modbus_rtu_t35_expired(struct modbus_rtu *);
 
 #endif /* _SYS_NET_MODBUS_MODBUS_RTU_H_ */
