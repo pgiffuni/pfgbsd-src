@@ -26,7 +26,27 @@ import struct
 import sys
 import os
 
-HDR = os.path.join(os.path.dirname(__file__), "..", "ext2_journal.h")
+def _resolve_header():
+    # This script used to live in sys/fs/ext2fs/tests/, so ../ext2_journal.h
+    # worked.  It is now a standalone test tool under tests/sys/fs/ext2fs/,
+    # so climb back to the tree root and locate the header from there
+    # instead of depending on a fixed relative depth.
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = here
+    for _ in range(12):
+        cand = os.path.join(base, "sys", "fs", "ext2fs", "ext2_journal.h")
+        if os.path.exists(cand):
+            return cand
+        parent = os.path.dirname(base)
+        if parent == base:
+            break
+        base = parent
+    # Fall back to the historical location for anyone who runs this straight
+    # out of a kernel source checkout at the old path.
+    return os.path.join(os.path.dirname(__file__), "..", "ext2_journal.h")
+
+
+HDR = _resolve_header()
 
 # Documented constants, from journal.rst.
 MAGIC = 0xC03B3998
