@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2011 The FreeBSD Foundation
- * All rights reserved.
  *
  * This software was developed by Pawel Jakub Dawidek under sponsorship from
  * the FreeBSD Foundation.
@@ -371,15 +370,17 @@ tls_exec_client(const char *user, int startfd, const char *srcaddr,
 	if (proto_connect(saddr, daddr, timeout, &tcp) == -1)
 		exit(EX_TEMPFAIL);
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	SSL_load_error_strings();
 	SSL_library_init();
+#endif
 
 	/*
 	 * TODO: On FreeBSD we could move this below sandbox() once libc and
 	 *       libcrypto use sysctl kern.arandom to obtain random data
 	 *       instead of /dev/urandom and friends.
 	 */
-	sslctx = SSL_CTX_new(TLSv1_client_method());
+	sslctx = SSL_CTX_new(TLS_client_method());
 	if (sslctx == NULL)
 		pjdlog_exitx(EX_TEMPFAIL, "SSL_CTX_new() failed.");
 
@@ -413,7 +414,7 @@ tls_exec_client(const char *user, int startfd, const char *srcaddr,
 	tls_certificate_verify(ssl, fingerprint);
 
 	/*
-	 * The following byte is send to make proto_connect_wait() to work.
+	 * The following byte is sent to make proto_connect_wait() work.
 	 */
 	connected = 1;
 	for (;;) {
@@ -460,7 +461,7 @@ tls_call_exec_client(struct proto_conn *sock, const char *srcaddr,
 		proto_close(sock);
 	} else {
 		/*
-		 * The FD_CLOEXEC is cleared by dup2(2), so when we not
+		 * The FD_CLOEXEC is cleared by dup2(2), so when we do not
 		 * call it, we have to clear it by hand in case it is set.
 		 */
 		if (fcntl(startfd, F_SETFD, 0) == -1)
@@ -663,10 +664,12 @@ tls_exec_server(const char *user, int startfd, const char *privkey,
 	sockfd = startfd;
 	tcpfd = startfd + 1;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	SSL_load_error_strings();
 	SSL_library_init();
+#endif
 
-	sslctx = SSL_CTX_new(TLSv1_server_method());
+	sslctx = SSL_CTX_new(TLS_server_method());
 	if (sslctx == NULL)
 		pjdlog_exitx(EX_TEMPFAIL, "SSL_CTX_new() failed.");
 
@@ -676,10 +679,10 @@ tls_exec_server(const char *user, int startfd, const char *privkey,
 	if (ssl == NULL)
 		pjdlog_exitx(EX_TEMPFAIL, "SSL_new() failed.");
 
-	if (SSL_use_RSAPrivateKey_file(ssl, privkey, SSL_FILETYPE_PEM) != 1) {
+	if (SSL_use_PrivateKey_file(ssl, privkey, SSL_FILETYPE_PEM) != 1) {
 		ssl_log_errors();
 		pjdlog_exitx(EX_CONFIG,
-		    "SSL_use_RSAPrivateKey_file(%s) failed.", privkey);
+		    "SSL_use_PrivateKey_file(%s) failed.", privkey);
 	}
 
 	if (SSL_use_certificate_file(ssl, cert, SSL_FILETYPE_PEM) != 1) {
@@ -850,7 +853,7 @@ tls_wrap(int fd, bool client, void **ctxp)
 	if (tlsctx == NULL)
 		return (errno);
 
-	if (proto_wrap("socketpair", client, fd, &sock) == -1) {
+	if (proto_wrap("skp", client, fd, &sock) == -1) {
 		error = errno;
 		free(tlsctx);
 		return (error);
@@ -867,7 +870,7 @@ tls_wrap(int fd, bool client, void **ctxp)
 }
 
 static int
-tls_send(void *ctx, const unsigned char *data, size_t size, int fd)
+tls_send(void *ctx, const void *data, size_t size, int fd)
 {
 	struct tls_ctx *tlsctx = ctx;
 
@@ -886,7 +889,7 @@ tls_send(void *ctx, const unsigned char *data, size_t size, int fd)
 }
 
 static int
-tls_recv(void *ctx, unsigned char *data, size_t size, int *fdp)
+tls_recv(void *ctx, void *data, size_t size, int *fdp)
 {
 	struct tls_ctx *tlsctx = ctx;
 

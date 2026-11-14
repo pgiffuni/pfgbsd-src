@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2012 The FreeBSD Foundation
- * All rights reserved.
  *
  * This software was developed by Pawel Jakub Dawidek under sponsorship from
  * the FreeBSD Foundation.
@@ -140,7 +139,7 @@ static void
 adreq_decode_and_validate_header(struct adreq *adreq)
 {
 
-	/* Byte-swap only is the sender is using different byte order. */
+	/* Byte-swap only if the sender is using different byte order. */
 	if (adreq->adr_byteorder != ADIST_BYTEORDER) {
 		adreq->adr_byteorder = ADIST_BYTEORDER;
 		adreq->adr_seq = bswap64(adreq->adr_seq);

@@ -1,6 +1,12 @@
 /*-
  * Copyright (c) 2004-2009 Apple Inc.
+ * Copyright (c) 2017 Robert N. M. Watson
  * All rights reserved.
+ *
+ * Portions of this software were developed by BAE Systems, the University of
+ * Cambridge Computer Laboratory, and Memorial University under DARPA/AFRL
+ * contract FA8650-15-C-7558 ("CADETS"), as part of the DARPA Transparent
+ * Computing (TC) research program.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -202,6 +208,20 @@ typedef struct {
 	u_int16_t	 len;
 	char		*text;
 } au_arg64_t;
+
+/*
+ * token ID                1 byte
+ * argument #              1 byte
+ * uuid                    16 bytes
+ * text length             2 bytes
+ * text                    N bytes + 1 terminating NULL byte
+ */
+typedef struct {
+	u_char		no;
+	u_int8_t	uuid[16];
+	u_int16_t	len;
+	char		*text;
+} au_arg_uuid_t;
 
 /*
  * how to print            1 byte
@@ -528,6 +548,20 @@ typedef struct {
 } au_ret64_t;
 
 /*
+ * token ID                1 byte
+ * return value #          1 byte
+ * uuid                    16 bytes
+ * text length             2 bytes
+ * text                    N bytes + 1 terminating NULL byte
+ */
+typedef struct {
+	u_char		 no;
+	u_int8_t	 uuid[16];
+	u_int16_t	 len;
+	char		*text;
+} au_ret_uuid_t;
+
+/*
  * sequence number         4 bytes
  */
 typedef struct {
@@ -586,12 +620,18 @@ typedef struct {
 } au_socketinet32_t;
 
 /*
+ * Largest sun_path across all supported platforms (Linux and Solaris use 108,
+ * macOS and FreeBSD use 104).
+ */
+#define	AU_UNIX_PATH_MAX	108
+
+/*
  * socket family           2 bytes
- * path                    104 bytes
+ * path                    up to AU_UNIX_PATH_MAX bytes (NUL terminated)
  */
 typedef struct {
 	u_int16_t	family;
-	char		path[104];
+	char		path[AU_UNIX_PATH_MAX];
 } au_socketunix_t;
 
 /*
@@ -735,6 +775,7 @@ struct tokenstr {
 	union {
 		au_arg32_t		arg32;
 		au_arg64_t		arg64;
+		au_arg_uuid_t		arg_uuid;
 		au_arb_t		arb;
 		au_attr32_t		attr32;
 		au_attr64_t		attr64;
@@ -761,6 +802,7 @@ struct tokenstr {
 		au_proc64ex_t		proc64_ex;
 		au_ret32_t		ret32;
 		au_ret64_t		ret64;
+		au_ret_uuid_t		ret_uuid;
 		au_seq_t		seq;
 		au_socket_t		socket;
 		au_socket_ex32_t	socket_ex32;
@@ -871,21 +913,6 @@ void			 au_print_tok_xml(FILE *outfp, tokenstr_t *tok,
  */
 void			 au_print_xml_header(FILE *outfp);
 void			 au_print_xml_footer(FILE *outfp);
-
-/*
- * BSM library routines for converting between local and BSM constant spaces.
- * (Note: some of these are replicated in audit_record.h for the benefit of
- * the FreeBSD and Mac OS X kernels)
- */
-int	 au_bsm_to_domain(u_short bsm_domain, int *local_domainp);
-int	 au_bsm_to_errno(u_char bsm_error, int *errorp);
-int	 au_bsm_to_fcntl_cmd(u_short bsm_fcntl_cmd, int *local_fcntl_cmdp);
-int	 au_bsm_to_socket_type(u_short bsm_socket_type,
-	    int *local_socket_typep);
-u_short	 au_domain_to_bsm(int local_domain);
-u_char	 au_errno_to_bsm(int local_errno);
-u_short	 au_fcntl_cmd_to_bsm(int local_fcntl_command);
-u_short	 au_socket_type_to_bsm(int local_socket_type);
 
 const char	 *au_strerror(u_char bsm_error);
 __END_DECLS

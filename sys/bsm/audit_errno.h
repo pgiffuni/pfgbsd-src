@@ -24,7 +24,7 @@
  * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
  * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE. 
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #ifndef _BSM_AUDIT_ERRNO_H_
@@ -161,6 +161,7 @@
 #define	BSM_ERRNO_EALREADY		149
 #define	BSM_ERRNO_EINPROGRESS		150
 #define	BSM_ERRNO_ESTALE		151
+#define	BSM_ERRNO_EQFULL		152
 
 /*
  * OpenBSM constants for error numbers not defined in Solaris.  In the event
@@ -204,6 +205,7 @@
 #define	BSM_ERRNO_EKEYREJECTED		222	/* Linux-specific. */
 #define	BSM_ERRNO_ENOTCAPABLE		223	/* FreeBSD-specific. */
 #define	BSM_ERRNO_ECAPMODE		224	/* FreeBSD-specific. */
+#define	BSM_ERRNO_EINTEGRITY		225	/* FreeBSD-specific. */
 
 /*
  * In the event that OpenBSM doesn't have a file representation of a local

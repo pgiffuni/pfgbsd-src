@@ -108,6 +108,19 @@ static gid_t	audit_review_gid = -1;
 static char	*lastfile = NULL;
 
 /*
+ * File descriptor to our locked pid file.
+ */
+static int	pidfd = -1;
+
+#ifndef USE_MACH_IPC
+/*
+ * Original signal mask in effect at startup.  Used by the main event loop
+ * and the log child.
+ */
+sigset_t	auditd_origmask;
+#endif /* !USE_MACH_IPC */
+
+/*
  * Error starting auditd. Run warn script and exit.
  */
 static void
@@ -354,12 +367,20 @@ close_misc(void)
 		auditd_log_err("Couldn't remove %s: %m", AUDITD_PIDFILE);
 		return (1);
 	}
+	close(pidfd);
+	pidfd = -1;
 	endac();
 
 	if (auditd_close_trigger() != 0) {
 		auditd_log_err("Error closing trigger messaging mechanism");
 		return (1);
 	}
+
+#ifndef USE_MACH_IPC
+	/* Restore the original signal mask. */
+	sigprocmask(SIG_SETMASK, &auditd_origmask, NULL);
+#endif /* !USE_MACH_IPC */
+
 	return (0);
 }
 
@@ -415,55 +436,72 @@ close_all(void)
 static int
 register_daemon(void)
 {
-	FILE * pidfile;
-	int fd;
-	pid_t pid;
+	struct sigaction action;
+	sigset_t sigmask;
+
+#ifndef USE_MACH_IPC
+	/* Set up the signal mask. */
+	sigemptyset(&sigmask);
+	sigaddset(&sigmask, SIGTERM);
+	sigaddset(&sigmask, SIGALRM);
+	sigaddset(&sigmask, SIGCHLD);
+	sigaddset(&sigmask, SIGHUP);
+	sigprocmask(SIG_BLOCK, &sigmask, &auditd_origmask);
+#endif /* !USE_MACH_IPC */
 
 	/* Set up the signal hander. */
-	if (signal(SIGTERM, auditd_relay_signal) == SIG_ERR) {
+	action.sa_handler = auditd_relay_signal;
+	/*
+	 * sa_flags must not include SA_RESTART, so that read(2) will be
+	 * interruptible in auditd_wait_for_events
+	 */
+	action.sa_flags = 0;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGTERM, &action, NULL) != 0) {
 		auditd_log_err(
 		    "Could not set signal handler for SIGTERM");
 		fail_exit();
 	}
-	if (signal(SIGCHLD, auditd_relay_signal) == SIG_ERR) {
+	if (sigaction(SIGCHLD, &action, NULL) != 0) {
 		auditd_log_err(
 		    "Could not set signal handler for SIGCHLD");
 		fail_exit();
 	}
-	if (signal(SIGHUP, auditd_relay_signal) == SIG_ERR) {
+	if (sigaction(SIGHUP, &action, NULL) != 0) {
 		auditd_log_err(
 		    "Could not set signal handler for SIGHUP");
 		fail_exit();
 	}
-	if (signal(SIGALRM, auditd_relay_signal) == SIG_ERR) {
+	if (sigaction(SIGALRM, &action, NULL) != 0) {
 		auditd_log_err(
 		    "Could not set signal handler for SIGALRM");
 		fail_exit();
 	}
 
-	if ((pidfile = fopen(AUDITD_PIDFILE, "a")) == NULL) {
+	/* Open the pid file. */
+	pidfd = open(AUDITD_PIDFILE, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC,
+	    S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	if (pidfd < 0) {
 		auditd_log_err("Could not open PID file");
 		audit_warn_tmpfile();
 		return (-1);
 	}
 
 	/* Attempt to lock the pid file; if a lock is present, exit. */
-	fd = fileno(pidfile);
-	if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+	if (flock(pidfd, LOCK_EX | LOCK_NB) < 0) {
 		auditd_log_err(
 		    "PID file is locked (is another auditd running?).");
 		audit_warn_ebusy();
 		return (-1);
 	}
 
-	pid = getpid();
-	ftruncate(fd, 0);
-	if (fprintf(pidfile, "%u\n", pid) < 0) {
+	/* Write our pid to the pid file and leave it open. */
+	ftruncate(pidfd, 0);
+	if (dprintf(pidfd, "%u\n", getpid()) < 0) {
 		/* Should not start the daemon. */
 		fail_exit();
 	}
 
-	fflush(pidfile);
 	return (0);
 }
 
@@ -704,7 +742,7 @@ auditd_config_controls(void)
 	 */
 	err = auditd_set_qsize();
 	if (err) {
-		auditd_log_err("audit_set_qsize() %s: %m",
+		auditd_log_err("auditd_set_qsize() %s: %m",
 		    auditd_strerror(err));
 		ret = -1;
 	} else
