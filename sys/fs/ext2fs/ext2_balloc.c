@@ -218,6 +218,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * Write synchronously so that indirect blocks
 		 * never point at garbage.
 		 */
+		bp->b_flags |= B_INVALONERR;
 		if ((error = ext2_dep_bwrite(bp)) != 0) {
 			/* bwrite() released bp; pref is still unreferenced. */
 			ext2_rollback_unpublished(ip, pref, 1);
@@ -267,10 +268,11 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		/*
 		 * The new block must reach the disk before the parent names
 		 * it.  Record that as a dependency rather than relying on
-		 * the code below happening to keep the order, so that the
+* the code below happening to keep the order, so that the
 		 * ordering is stated where it can be checked and survives
 		 * the writes being relaxed later.
 		 */
+		nbp->b_flags |= B_INVALONERR;
 		pdep = ext2_dep_create(ip, bp, EXT2_DEP_METADATA);
 		ndep = ext2_dep_create(ip, nbp, EXT2_DEP_NEWBLK);
 		if (pdep != NULL && ndep != NULL)
@@ -287,36 +289,6 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 			ext2_dep_defer(nbp, EXT2_SD_ASYNC_NEWBLK);
 			error = 0;
 		} else if ((error = ext2_dep_bwrite(nbp)) != 0) {
-			/* bwrite() released nbp; pref is still unreferenced. */
-			ext2_dep_discard(bp);
-			ext2_rollback_unpublished(ip, pref, 1);
-			brelse(bp);
-			return (error);
-		}
-		EXT2_CRASH(EXT2_CRASH_AFTER_INDIR_WRITE);
-		EXT2_CRASH(EXT2_CRASH_BEFORE_PARENT);
-		bap[indirs[i - 1].in_off] = htole32(pref);
-		EXT2_CRASH(EXT2_CRASH_AFTER_PARENT);
-		/*
-		 * If required, write synchronously, otherwise use
-		 * delayed write.  bwrite() and bdwrite() both release
-		 * 'bp' internally; the loop re-assigns bp via bread()
-		 * at the top of the next iteration.
-		 */
-		if (flags & IO_SYNC) {
-			if ((error = ext2_dep_bwrite(bp)) != 0) {
-				/*
-				 * The child indirect block is on disk but
-				 * unreachable: the parent that names it is not.
-				 */
-				ext2_rollback_unpublished(ip, pref, 1);
-				bp = NULL;
-				return (error);
-			}
-		} else {
-			if (bp->b_bufsize == fs->e2fs_bsize)
-				bp->b_flags |= B_CLUSTEROK;
-			ext2_dep_defer(bp, EXT2_SD_ASYNC_NEWBLK);
 			bp = NULL;
 		}
 	}
@@ -366,6 +338,7 @@ ext2_balloc(struct inode *ip, e2fs_lbn_t lbn, int size, struct ucred *cred,
 		 * delayed write.
 		 */
 		if (flags & IO_SYNC) {
+			bp->b_flags |= B_INVALONERR;
 			if ((error = ext2_dep_bwrite(bp)) != 0) {
 				/*
 				 * The parent indirect block did not reach

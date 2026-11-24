@@ -831,20 +831,31 @@ ext4_ext_dirty(struct inode *ip, struct ext4_extent_path *path)
 			return (EIO);
 		ext4_ext_fill_path_buf(path, bp);
 		ext2_extent_blk_csum_set(ip, bp->b_data);
+		bp->b_flags |= B_INVALONERR;
+
+		/*
+		 * Hand the block to the transaction before it reaches its
+		 * home location.  This is the point where the extent
+		 * mutation becomes journalled at all: without it a
+		 * transaction can commit with no copy of the metadata that
+		 * the operation was about, which is the difference between
+		 * a journal and a log of nothing.
+		 *
+		 * The buffer is still written home below.  That is
+		 * deliberate -- the journal is what makes the operation
+		 * atomic, and the home write is what makes it cheap --
+		 * but the commit record is not written until after the
+		 * data blocks, so a crash before it leaves a transaction
+		 * with no commit and nothing replayed, which is recoverable.
+		 */
+		if (ip->i_ump->um_jtrans != NULL) {
+			error = ext2_journal_dirty_metadata(ip->i_ump->um_jtrans,
+			    bp);
+			if (error)
+				return (error);
+		}
 		error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 		if (error) {
-			/*
-			 * bwrite() left the modified extent tree dirty in
-			 * the cache.  Discard it, so a later read sees the
-			 * on-disk tree instead of one naming blocks the
-			 * caller's rollback is about to free.
-			 */
-			bp = getblk(ip->i_devvp, fsbtodb(fs, blk),
-			    fs->e2fs_bsize, 0, 0, 0);
-			if (bp) {
-				bundirty(bp);
-				brelse(bp);
-			}
 			return (error);
 		}
 	} else {
@@ -973,8 +984,10 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 	    M_EXT2EXTENTS, M_WAITOK | M_ZERO);
 	for (a = 0; a < depth - at; a++) {
 		newblk = ext4_ext_alloc_meta(ip);
-		if (newblk == 0)
+		if (newblk == 0) {
+			error = ENOSPC;
 			goto cleanup;
+		}
 		ablks[a] = newblk;
 	}
 
@@ -1014,6 +1027,7 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 	}
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
+	bp->b_flags |= B_INVALONERR;
 	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	bp = NULL;
 	if (error)
@@ -1064,14 +1078,15 @@ ext4_ext_split(struct inode *ip, struct ext4_extent_path *path,
 			neh->eh_ecount = htole16(le16toh(neh->eh_ecount) + m);
 		}
 
-		ext2_extent_blk_csum_set(ip, bp->b_data);
-		error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
-		bp = NULL;
-		if (error)
-			goto cleanup;
+ext2_extent_blk_csum_set(ip, bp->b_data);
+	bp->b_flags |= B_INVALONERR;
+	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
+	bp = NULL;
+	if (error)
+		goto cleanup;
 
-		/* Fix old index. */
-		if (m) {
+	/* Fix old index. */
+	if (m) {
 			path[i].ep_header->eh_ecount =
 			    htole16(le16toh(path[i].ep_header->eh_ecount) - m);
 			error = ext4_ext_dirty(ip, path + i);
@@ -1118,7 +1133,7 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 
 	newblk = ext4_ext_alloc_meta(ip);
 	if (newblk == 0)
-		return (error);
+		return (ENOSPC);
 
 	bp = getblk(ip->i_devvp, fsbtodb(fs, newblk), fs->e2fs_bsize, 0, 0, 0);
 	if (!bp) {
@@ -1139,9 +1154,11 @@ ext4_ext_grow_indepth(struct inode *ip, struct ext4_extent_path *path,
 		neh->eh_max = htole16(ext4_ext_space_block(ip));
 
 	ext2_extent_blk_csum_set(ip, bp->b_data);
+	bp->b_flags |= B_INVALONERR;
 	error = ext2_dep_write(bp, EXT2_SD_ASYNC_EXTENT);
 	if (error) {
 		ext2_rollback_unpublished(ip, newblk, 1);
+		bp = NULL;
 		goto out;
 	}
 
@@ -1275,6 +1292,8 @@ ext4_ext_insert_extent(struct inode *ip, struct ext4_extent_path *path,
 	struct ext4_extent *ex, *nex, *nearex;
 	struct ext4_extent_path *npath;
 	int depth, len, error, next;
+	char saved_i_data[sizeof(ip->i_data)];
+	bool saved_i_data_valid = false;
 
 	depth = ext4_ext_inode_depth(ip);
 	ex = path[depth].ep_ext;
@@ -1285,6 +1304,10 @@ ext4_ext_insert_extent(struct inode *ip, struct ext4_extent_path *path,
 
 	/* Insert block into found extent. */
 	if (ex && ext4_can_extents_be_merged(ex, newext)) {
+		if (depth == 0) {
+			memcpy(saved_i_data, ip->i_data, sizeof(ip->i_data));
+			saved_i_data_valid = true;
+		}
 		ex->e_len = htole16(le16toh(ex->e_len) + le16toh(newext->e_len));
 		eh = path[depth].ep_header;
 		nearex = ex;
@@ -1333,6 +1356,10 @@ repeat:
 	eh = path[depth].ep_header;
 
 has_space:
+	if (depth == 0 && !saved_i_data_valid) {
+		memcpy(saved_i_data, ip->i_data, sizeof(ip->i_data));
+		saved_i_data_valid = true;
+	}
 	nearex = path[depth].ep_ext;
 	if (!nearex) {
 		/* Create new extent in the leaf. */
@@ -1388,8 +1415,12 @@ merge:
 		goto cleanup;
 
 	error = ext4_ext_dirty(ip, path + depth);
-	if (error)
+	if (error) {
+		if (depth == 0 && saved_i_data_valid) {
+			memcpy(ip->i_data, saved_i_data, sizeof(ip->i_data));
+		}
 		goto cleanup;
+	}
 
 	/*
 	 * ext4_ext_dirty() wrote the tree out, so the extent now names
