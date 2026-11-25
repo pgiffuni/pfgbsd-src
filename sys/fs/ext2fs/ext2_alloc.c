@@ -835,19 +835,22 @@ ext2_valloc(struct vnode *pvp, int mode, struct ucred *cred, struct vnode **vpp)
 
 	error = insmntque(vp, ump->um_mountp);
 	if (error) {
-		vput(vp);
+		if (!VN_IS_DOOMED(vp))
+			vput(vp);
 		return (error);
 	}
 
 	error = vfs_hash_insert(vp, ino, LK_EXCLUSIVE, td, vpp, NULL, NULL);
 	if (error || *vpp != NULL) {
 		*vpp = NULL;
-		vput(vp);
+		if (!VN_IS_DOOMED(vp))
+			vput(vp);
 		return (error);
 	}
 
 	if ((error = ext2_vinit(ump->um_mountp, &ext2_fifoops, &vp)) != 0) {
-		vput(vp);
+		if (!VN_IS_DOOMED(vp))
+			vput(vp);
 		*vpp = NULL;
 		return (error);
 	}
