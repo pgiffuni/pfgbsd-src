@@ -46,6 +46,8 @@
 #include <fs/ext2fs/ext2_extern.h>
 #include <fs/ext2fs/ext2_softdep.h>
 
+MALLOC_DEFINE(M_EXT2SOFTSDEP, "ext2softdep", "Ext2 soft dependencies");
+
 static const char *ext2_dep_typenames[] = {
 	[EXT2_DEP_NEWBLK]	= "newblk",
 	[EXT2_DEP_METADATA]	= "metadata",
