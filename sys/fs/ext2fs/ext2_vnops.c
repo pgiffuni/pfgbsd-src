@@ -795,6 +795,8 @@ ext2_rename(struct vop_rename_args *ap)
 	int doingdirectory = 0, oldparent = 0, newparent = 0;
 	int error = 0;
 	u_char namlen;
+	struct ucred *tcred = tcnp->cn_cred ? tcnp->cn_cred : curthread->td_ucred;
+	struct ucred *fcred = fcnp->cn_cred ? fcnp->cn_cred : curthread->td_ucred;
 
 	/*
 	 * Check for cross-device rename.
@@ -896,7 +898,7 @@ abortit:
 	 * to namei, as the parent directory is unlocked by the
 	 * call to checkpath().
 	 */
-	error = VOP_ACCESS(fvp, VWRITE, tcnp->cn_cred, curthread);
+	error = VOP_ACCESS(fvp, VWRITE, tcred, curthread);
 	VOP_UNLOCK(fvp);
 	if (oldparent != dp->i_number)
 		newparent = dp->i_number;
@@ -905,7 +907,7 @@ abortit:
 			goto bad;
 		if (xp != NULL)
 			vput(tvp);
-		error = ext2_checkpath(ip, dp, tcnp->cn_cred);
+		error = ext2_checkpath(ip, dp, tcred);
 		if (error)
 			goto out;
 		vref(tdvp);
@@ -967,9 +969,9 @@ abortit:
 		 * otherwise the destination may not be changed (except by
 		 * root). This implements append-only directories.
 		 */
-		if ((dp->i_mode & S_ISTXT) && tcnp->cn_cred->cr_uid != 0 &&
-		    tcnp->cn_cred->cr_uid != dp->i_uid &&
-		    xp->i_uid != tcnp->cn_cred->cr_uid) {
+		if ((dp->i_mode & S_ISTXT) && tcred->cr_uid != 0 &&
+		    tcred->cr_uid != dp->i_uid &&
+		    xp->i_uid != tcred->cr_uid) {
 			error = EPERM;
 			goto bad;
 		}
@@ -979,7 +981,7 @@ abortit:
 		 * (both directories, or both not directories).
 		 */
 		if ((xp->i_mode & IFMT) == IFDIR) {
-			if (!ext2_dirempty(xp, dp->i_number, tcnp->cn_cred)) {
+			if (!ext2_dirempty(xp, dp->i_number, tcred)) {
 				error = ENOTEMPTY;
 				goto bad;
 			}
@@ -1021,7 +1023,7 @@ abortit:
 			if (xp->i_nlink > 2)
 				panic("ext2_rename: linked directory");
 			error = ext2_truncate(tvp, (off_t)0, IO_SYNC,
-			    tcnp->cn_cred, curthread);
+			    tcred, curthread);
 			xp->i_nlink = 0;
 		}
 		xp->i_flag |= IN_CHANGE;
@@ -1080,7 +1082,7 @@ abortit:
 			error = vn_rdwr(UIO_READ, fvp, (caddr_t)dirbuf,
 			    ip->i_e2fs->e2fs_bsize, (off_t)0,
 			    UIO_SYSSPACE, IO_NODELOCKED | IO_NOMACCHECK,
-			    tcnp->cn_cred, NOCRED, NULL, NULL);
+			    fcred, NOCRED, NULL, NULL);
 			if (error == 0) {
 				/* Like ufs little-endian: */
 				namlen = dirbuf->dotdot_type;
@@ -1113,7 +1115,7 @@ abortit:
 					    ip->i_e2fs->e2fs_bsize,
 					    (off_t)0, UIO_SYSSPACE,
 					    IO_NODELOCKED | IO_SYNC |
-					    IO_NOMACCHECK, tcnp->cn_cred,
+					    IO_NOMACCHECK, fcred,
 					    NOCRED, NULL, NULL);
 					cache_purge(fdvp);
 				}
@@ -1313,8 +1315,10 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 	struct dirtemplate dirtemplate, *dtp;
 	char *buf = NULL;
 	int error, dmode;
+	struct ucred *cred;
 
 	dp = VTOI(dvp);
+	cred = cnp->cn_cred ? cnp->cn_cred : curthread->td_ucred;
 	if ((nlink_t)dp->i_nlink >= EXT4_LINK_MAX &&
 	    !EXT2_HAS_RO_COMPAT_FEATURE(dp->i_e2fs, EXT2F_ROCOMPAT_DIR_NLINK)) {
 		error = EMLINK;
@@ -1327,7 +1331,7 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 	 * but not have it entered in the parent directory. The entry is
 	 * made later after writing "." and ".." entries.
 	 */
-	error = ext2_valloc(dvp, dmode, cnp->cn_cred, &tvp);
+	error = ext2_valloc(dvp, dmode, cred, &tvp);
 	if (error)
 		goto out;
 	ip = VTOI(tvp);
@@ -1339,20 +1343,18 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 		 * if we are hacking owners here, (only do this where told to)
 		 * and we are not giving it TOO root, (would subvert quotas)
 		 * then go ahead and give it to the other user.
-		 * The new directory also inherits the SUID bit.
-		 * If user's UID and dir UID are the same,
-		 * 'give it away' so that the SUID is still forced on.
+		 * Note that this drops off the execute bits for security.
 		 */
 		if ((dvp->v_mount->mnt_flag & MNT_SUIDDIR) &&
 		    (dp->i_mode & ISUID) && dp->i_uid) {
 			dmode |= ISUID;
 			ip->i_uid = dp->i_uid;
 		} else {
-			ip->i_uid = cnp->cn_cred->cr_uid;
+			ip->i_uid = cred->cr_uid;
 		}
 	}
 #else
-	ip->i_uid = cnp->cn_cred->cr_uid;
+	ip->i_uid = cred->cr_uid;
 #endif
 	ip->i_flag |= IN_ACCESS | IN_CHANGE | IN_UPDATE;
 	ip->i_mode = dmode;
@@ -1401,7 +1403,7 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 	ext2_dirent_csum_set(ip, (struct ext2fs_direct_2 *)buf);
 	error = vn_rdwr(UIO_WRITE, tvp, (caddr_t)buf,
 	    DIRBLKSIZ, (off_t)0, UIO_SYSSPACE,
-	    IO_NODELOCKED | IO_SYNC | IO_NOMACCHECK, cnp->cn_cred, NOCRED,
+	    IO_NODELOCKED | IO_SYNC | IO_NOMACCHECK, cred, NOCRED,
 	    NULL, NULL);
 	if (error) {
 		ext2_dec_nlink(dp);
@@ -1419,7 +1421,7 @@ ext2_mkdir(struct vop_mkdir_args *ap)
 #ifdef UFS_ACL
 	if (dvp->v_mount->mnt_flag & MNT_ACLS) {
 		error = ext2_do_posix1e_acl_inheritance_dir(dvp, tvp, dmode,
-		    cnp->cn_cred, curthread);
+		    cred, curthread);
 		if (error)
 			goto bad;
 	}
@@ -1460,10 +1462,12 @@ ext2_rmdir(struct vop_rmdir_args *ap)
 	struct vnode *dvp = ap->a_dvp;
 	struct componentname *cnp = ap->a_cnp;
 	struct inode *ip, *dp;
+	struct ucred *cred;
 	int error;
 
 	ip = VTOI(vp);
 	dp = VTOI(dvp);
+	cred = cnp->cn_cred ? cnp->cn_cred : curthread->td_ucred;
 
 	/*
 	 * Verify the directory is empty (and valid).
@@ -1472,7 +1476,7 @@ ext2_rmdir(struct vop_rmdir_args *ap)
 	 *  the current directory and thus be
 	 *  non-empty.)
 	 */
-	if (!ext2_dirempty(ip, dp->i_number, cnp->cn_cred)) {
+	if (!ext2_dirempty(ip, dp->i_number, cred)) {
 		error = ENOTEMPTY;
 		goto out;
 	}
@@ -1498,7 +1502,7 @@ ext2_rmdir(struct vop_rmdir_args *ap)
 	 * in the directory is "." and "..".
 	 */
 	ip->i_nlink = 0;
-	error = ext2_truncate(vp, (off_t)0, IO_SYNC, cnp->cn_cred,
+	error = ext2_truncate(vp, (off_t)0, IO_SYNC, cred,
 	    curthread);
 	cache_purge(ITOV(ip));
 	if (vn_lock(dvp, LK_EXCLUSIVE | LK_NOWAIT) != 0) {
@@ -1519,12 +1523,14 @@ ext2_symlink(struct vop_symlink_args *ap)
 	struct vnode *vp, **vpp = ap->a_vpp;
 	struct inode *ip;
 	int len, error;
+	struct ucred *cred;
 
 	error = ext2_makeinode(IFLNK | ap->a_vap->va_mode, ap->a_dvp,
 	    vpp, ap->a_cnp);
 	if (error)
 		return (error);
 	vp = *vpp;
+	cred = ap->a_cnp->cn_cred ? ap->a_cnp->cn_cred : curthread->td_ucred;
 	len = strlen(ap->a_target);
 	if (len < VFSTOEXT2(vp->v_mount)->um_e2fs->e2fs_maxsymlinklen) {
 		ip = VTOI(vp);
@@ -1534,7 +1540,7 @@ ext2_symlink(struct vop_symlink_args *ap)
 	} else
 		error = vn_rdwr(UIO_WRITE, vp, __DECONST(void *, ap->a_target),
 		    len, (off_t)0, UIO_SYSSPACE, IO_NODELOCKED | IO_NOMACCHECK,
-		    ap->a_cnp->cn_cred, NOCRED, NULL, NULL);
+		    cred, NOCRED, NULL, NULL);
 	if (error)
 		vput(vp);
 	return (error);
@@ -1952,6 +1958,7 @@ ext2_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 {
 	struct inode *ip, *pdir;
 	struct vnode *tvp;
+	struct ucred *cred;
 	int error;
 
 	pdir = VTOI(dvp);
@@ -1959,7 +1966,9 @@ ext2_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 	if ((mode & IFMT) == 0)
 		mode |= IFREG;
 
-	error = ext2_valloc(dvp, mode, cnp->cn_cred, &tvp);
+	cred = cnp->cn_cred ? cnp->cn_cred : curthread->td_ucred;
+
+	error = ext2_valloc(dvp, mode, cred, &tvp);
 	if (error) {
 		return (error);
 	}
@@ -1977,22 +1986,22 @@ ext2_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 		 */
 		if ((dvp->v_mount->mnt_flag & MNT_SUIDDIR) &&
 		    (pdir->i_mode & ISUID) &&
-		    (pdir->i_uid != cnp->cn_cred->cr_uid) && pdir->i_uid) {
+		    (pdir->i_uid != cred->cr_uid) && pdir->i_uid) {
 			ip->i_uid = pdir->i_uid;
 			mode &= ~07111;
 		} else {
-			ip->i_uid = cnp->cn_cred->cr_uid;
+			ip->i_uid = cred->cr_uid;
 		}
 	}
 #else
-	ip->i_uid = cnp->cn_cred->cr_uid;
+	ip->i_uid = cred->cr_uid;
 #endif
 	ip->i_flag |= IN_ACCESS | IN_CHANGE | IN_UPDATE;
 	ip->i_mode = mode;
 	tvp->v_type = IFTOVT(mode);	/* Rest init'd in getnewvnode(). */
 	ip->i_nlink = 1;
-	if ((ip->i_mode & ISGID) && !groupmember(ip->i_gid, cnp->cn_cred)) {
-		if (priv_check_cred(cnp->cn_cred, PRIV_VFS_RETAINSUGID))
+	if ((ip->i_mode & ISGID) && !groupmember(ip->i_gid, cred)) {
+		if (priv_check_cred(cred, PRIV_VFS_RETAINSUGID))
 			ip->i_mode &= ~ISGID;
 	}
 
@@ -2010,7 +2019,7 @@ ext2_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 #ifdef UFS_ACL
 	if (dvp->v_mount->mnt_flag & MNT_ACLS) {
 		error = ext2_do_posix1e_acl_inheritance_file(dvp, tvp, mode,
-		    cnp->cn_cred, curthread);
+		    cred, curthread);
 		if (error)
 			goto bad;
 	}
