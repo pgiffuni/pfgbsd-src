@@ -321,7 +321,12 @@ ext2_orphan_unlink(struct inode *ip, uint32_t next)
 		pip = VTOI(pvp);
 	}
 	if (pvp != NULL) {
-		VTOI(pvp)->i_flag &= ~IN_ORPHAN_UNLINK;
+		/*
+		 * The IN_ORPHAN_UNLINK flag on the final traversal vnode must
+		 * remain set when we call vput().  ext2_inactive() will see
+		 * the flag, suppress recursive orphan cleanup, and clear it
+		 * before returning.  Do NOT clear it here.
+		 */
 		vput(pvp);
 	}
 
