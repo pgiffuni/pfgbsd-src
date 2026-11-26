@@ -169,6 +169,7 @@ struct inode {
  */
 #define	IN_E3INDEX	0x010000
 #define	IN_E4EXTENTS	0x020000
+#define	IN_ORPHAN_UNLINK	0x040000
 
 #define i_devvp i_ump->um_devvp
 

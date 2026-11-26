@@ -236,12 +236,23 @@ ext2_orphan_unlink(struct inode *ip, uint32_t next)
 	fs = ip->i_e2fs;
 	ump = ip->i_ump;
 
+	/*
+	 * Guard against recursive entry via vput_final() -> ext2_inactive()
+	 * -> ext2_orphan_release() -> ext2_orphan_unlink().  The orphan list
+	 * unlink must not be re-entered for the same inode.
+	 */
+	if (ip->i_flag & IN_ORPHAN_UNLINK)
+		return (0);
+	ip->i_flag |= IN_ORPHAN_UNLINK;
+
 	EXT2_LOCK(ump);
 	cur = le32toh(fs->e2fs->e3fs_last_orphan);
 	EXT2_UNLOCK(ump);
 
-	if (cur == 0)
+	if (cur == 0) {
+		ip->i_flag &= ~IN_ORPHAN_UNLINK;
 		return (ENOENT);
+	}
 
 	/*
 	 * If this inode is the head, the superblock holds the linkage and
@@ -251,11 +262,14 @@ ext2_orphan_unlink(struct inode *ip, uint32_t next)
 		EXT2_LOCK(ump);
 		fs->e2fs->e3fs_last_orphan = htole32(next);
 		EXT2_UNLOCK(ump);
+		ip->i_flag &= ~IN_ORPHAN_UNLINK;
 		return (ext2_sbupdate(ump, MNT_WAIT));
 	}
 
-	if (!ext2_orphan_valid(fs, cur))
+	if (!ext2_orphan_valid(fs, cur)) {
+		ip->i_flag &= ~IN_ORPHAN_UNLINK;
 		return (ENOENT);
+	}
 
 	/*
 	 * Otherwise some earlier inode names this one, and that inode has
@@ -268,8 +282,15 @@ ext2_orphan_unlink(struct inode *ip, uint32_t next)
 		bound = EXT2_ORPHAN_WALK_MAX;
 
 	error = VFS_VGET(ump->um_mountp, cur, LK_EXCLUSIVE, &pvp);
-	if (error)
+	if (error) {
+		ip->i_flag &= ~IN_ORPHAN_UNLINK;
 		return (error);
+	}
+	/*
+	 * Mark the vnode as being processed to suppress recursive
+	 * orphan cleanup via ext2_inactive().
+	 */
+	VTOI(pvp)->i_flag |= IN_ORPHAN_UNLINK;
 	pip = VTOI(pvp);
 
 	error = ENOENT;
@@ -286,15 +307,25 @@ ext2_orphan_unlink(struct inode *ip, uint32_t next)
 			break;
 
 		cur = nxt;
+		/*
+		 * Release current vnode.  The IN_ORPHAN_UNLINK flag on the
+		 * inode prevents ext2_inactive() from recursively invoking
+		 * ext2_orphan_unlink().  ext2_inactive() will clear the flag
+		 * when it checks for it.
+		 */
 		vput(pvp);
 		pvp = NULL;
 		if (VFS_VGET(ump->um_mountp, cur, LK_EXCLUSIVE, &pvp) != 0)
 			break;
+		VTOI(pvp)->i_flag |= IN_ORPHAN_UNLINK;
 		pip = VTOI(pvp);
 	}
-	if (pvp != NULL)
+	if (pvp != NULL) {
+		VTOI(pvp)->i_flag &= ~IN_ORPHAN_UNLINK;
 		vput(pvp);
+	}
 
+	ip->i_flag &= ~IN_ORPHAN_UNLINK;
 	return (error);
 }
 

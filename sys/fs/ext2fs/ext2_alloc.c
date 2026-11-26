@@ -846,10 +846,10 @@ ext2_valloc(struct vnode *pvp, int mode, struct ucred *cred, struct vnode **vpp)
 	if (*vpp != NULL) {
 		/*
 		 * Another thread already created the inode.  vfs_hash_insert
-		 * has returned the existing vnode in *vpp.  Discard our
-		 * newly allocated vnode and return the existing one.
+		 * has returned the existing vnode in *vpp and already disposed
+		 * of our newly allocated vnode (vgone/vput).  Return the
+		 * existing vnode.
 		 */
-		vput(vp);
 		return (0);
 	}
 

@@ -613,6 +613,15 @@ ext2_inactive(struct vop_inactive_args *ap)
 		goto out;
 	if (ip->i_nlink <= 0) {
 		/*
+		 * If the inode is currently being processed by ext2_orphan_unlink()
+		 * (i.e., it's on the orphan chain being traversed), skip the
+		 * orphan release to avoid recursive vnode lock acquisition.
+		 */
+		if (ip->i_flag & IN_ORPHAN_UNLINK) {
+			ip->i_flag &= ~IN_ORPHAN_UNLINK;
+			goto out;
+		}
+		/*
 		 * The last link is gone.  ext2_orphan_release() truncates,
 		 * writes the emptied inode, detaches it from the orphan list
 		 * if it is on one, and only then frees the inode number.
