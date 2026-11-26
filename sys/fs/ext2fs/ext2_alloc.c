@@ -841,11 +841,16 @@ ext2_valloc(struct vnode *pvp, int mode, struct ucred *cred, struct vnode **vpp)
 	}
 
 	error = vfs_hash_insert(vp, ino, LK_EXCLUSIVE, td, vpp, NULL, NULL);
-	if (error || *vpp != NULL) {
-		*vpp = NULL;
-		if (!VN_IS_DOOMED(vp))
-			vput(vp);
+	if (error)
 		return (error);
+	if (*vpp != NULL) {
+		/*
+		 * Another thread already created the inode.  vfs_hash_insert
+		 * has returned the existing vnode in *vpp.  Discard our
+		 * newly allocated vnode and return the existing one.
+		 */
+		vput(vp);
+		return (0);
 	}
 
 	if ((error = ext2_vinit(ump->um_mountp, &ext2_fifoops, &vp)) != 0) {
