@@ -573,6 +573,17 @@ ext2_htree_split_dirblock(struct inode *ip, char *block1, char *block2,
 	 * Fill in directory entry sort descriptors.
 	 */
 	while ((char *)ep < block1 + blksize - csum_size) {
+		uint16_t reclen = le16toh(ep->e2d_reclen);
+		/*
+		 * Check for invalid record length that would cause infinite loop
+		 * or point past the end of the block.
+		 */
+		if (reclen == 0 ||
+		    reclen < EXT2_DIR_REC_LEN(0) ||
+		    (reclen & EXT2_DIR_ROUND) != 0 ||
+		    (char *)ep + reclen > block1 + blksize - csum_size) {
+			return (EINVAL);
+		}
 		if (le32toh(ep->e2d_ino) && ep->e2d_namlen) {
 			entry_cnt++;
 			sort_info--;
@@ -584,7 +595,7 @@ ext2_htree_split_dirblock(struct inode *ip, char *block1, char *block2,
 			sort_info->h_hash = htole32(sort_info->h_hash);
 		}
 		ep = (struct ext2fs_direct_2 *)
-		    ((char *)ep + le16toh(ep->e2d_reclen));
+		    ((char *)ep + reclen);
 	}
 
 	/*
@@ -631,7 +642,18 @@ ext2_htree_split_dirblock(struct inode *ip, char *block1, char *block2,
 	entry_len = 0;
 	for (offset = 0; offset < blksize - csum_size; ) {
 		ep = (struct ext2fs_direct_2 *)(block1 + offset);
-		offset += le16toh(ep->e2d_reclen);
+		entry_len = le16toh(ep->e2d_reclen);
+		/*
+		 * Check for invalid record length that would cause infinite loop
+		 * or point past the end of the block.
+		 */
+		if (entry_len == 0 ||
+		    entry_len < EXT2_DIR_REC_LEN(0) ||
+		    (entry_len & EXT2_DIR_ROUND) != 0 ||
+		    offset + entry_len > blksize - csum_size) {
+			return (EINVAL);
+		}
+		offset += entry_len;
 		if (le32toh(ep->e2d_ino)) {
 			last = (struct ext2fs_direct_2 *)
 			    ((char *)last + entry_len);
@@ -733,8 +755,10 @@ ext2_htree_create_index(struct vnode *vp, struct componentname *cnp,
 	if (hash_version <= EXT2_HTREE_TEA)
 		hash_version += m_fs->e2fs_uhash;
 	ext2_get_hash_seed(fs, hash_seed);
-	ext2_htree_split_dirblock(dp, buf1, buf2, blksize, hash_seed,
+	error = ext2_htree_split_dirblock(dp, buf1, buf2, blksize, hash_seed,
 	    hash_version, &split_hash, new_entry);
+	if (error)
+		goto out;
 	ext2_htree_insert_entry(&info, split_hash, 2);
 
 	/*
@@ -926,8 +950,10 @@ ext2_htree_add_entry(struct vnode *dvp, struct ext2fs_direct_2 *entry,
 	/* Split target directory block */
 	newdirblock = malloc(blksize, M_TEMP, M_WAITOK | M_ZERO);
 	ext2_get_hash_seed(fs, hash_seed);
-	ext2_htree_split_dirblock(ip, (char *)bp->b_data, newdirblock, blksize,
+	error = ext2_htree_split_dirblock(ip, (char *)bp->b_data, newdirblock, blksize,
 	    hash_seed, hash_version, &split_hash, entry);
+	if (error)
+		goto finish;
 	cursize = roundup(ip->i_size, blksize);
 	dirsize = cursize + blksize;
 	blknum = dirsize / blksize - 1;
